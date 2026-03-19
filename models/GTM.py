@@ -267,7 +267,7 @@ class GTM(pl.LightningModule):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0)).to('cuda:'+str(self.gpu_num))
         return mask
 
-    def forward(self, category, color, fabric, temporal_features, gtrends, images):
+    def forward(self, category, color, fabric, temporal_features, gtrends, images, return_embedding: bool = False): # add return_embedding
         # Encode features and get inputs
         img_encoding = self.image_encoder(images)
         dummy_encoding = self.dummy_encoder(temporal_features)
@@ -284,16 +284,30 @@ class GTM(pl.LightningModule):
             tgt = self.pos_encoder(tgt)
             tgt_mask = self._generate_square_subsequent_mask(self.output_len)
             memory = gtrend_encoding
-            decoder_out, attn_weights = self.decoder(tgt, memory, tgt_mask)
+            # --- add --- 
+            decoder_ret = self.decoder(tgt, memory, tgt_mask)
+            # Some PyTorch versions may return (output, attn_weights); handle both.
+            decoder_out = decoder_ret[0] if isinstance(decoder_ret, tuple) else decoder_ret
+            # --- add ---
             forecast = self.decoder_fc(decoder_out)
         else:
             # Decode (generatively/non-autoregressively)
             tgt = static_feature_fusion.unsqueeze(0)
             memory = gtrend_encoding
-            decoder_out, attn_weights = self.decoder(tgt, memory)
+            # --- add ---
+            decoder_ret = self.decoder(tgt, memory)
+            decoder_out = decoder_ret[0] if isinstance(decoder_ret, tuple) else decoder_ret
+            # --- add ---
             forecast = self.decoder_fc(decoder_out)
-
-        return forecast.view(-1, self.output_len), attn_weights
+        # --- alter the output --- add --- 这里的fused feature就是我们想要的融合特征矩阵
+        pred = forecast.view(-1, self.output_len)
+        if return_embedding:
+            # Cross-attention output / multi-modal fused representation.
+            # decoder_out is (T, B, D) -> (B, T, D)
+            fused_feature = decoder_out.transpose(0, 1)
+            return pred, fused_feature
+        return pred
+        # --- add ---
 
     def configure_optimizers(self):
         optimizer = Adafactor(self.parameters(),scale_parameter=True, relative_step=True, warmup_init=True, lr=None)
@@ -303,7 +317,7 @@ class GTM(pl.LightningModule):
 
     def training_step(self, train_batch, batch_idx):
         item_sales, category, color, fabric, temporal_features, gtrends, images = train_batch 
-        forecasted_sales, _ = self.forward(category, color, fabric, temporal_features, gtrends, images)
+        forecasted_sales = self.forward(category, color, fabric, temporal_features, gtrends, images)
         loss = F.mse_loss(item_sales, forecasted_sales.squeeze())
         self.log('train_loss', loss)
 
@@ -311,7 +325,7 @@ class GTM(pl.LightningModule):
 
     def validation_step(self, test_batch, batch_idx):
         item_sales, category, color, fabric, temporal_features, gtrends, images = test_batch 
-        forecasted_sales, _ = self.forward(category, color, fabric, temporal_features, gtrends, images)
+        forecasted_sales = self.forward(category, color, fabric, temporal_features, gtrends, images)
         
         return item_sales.squeeze(), forecasted_sales.squeeze()
 
