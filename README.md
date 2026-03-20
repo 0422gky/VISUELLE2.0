@@ -46,6 +46,9 @@ To train the model of GTM-Transformer please use the following scripts. Please c
 python train.py --data_folder dataset
 ```
 
+```bash
+python train.py --data_folder "./" --gpu_num 0 --model_type GTM
+```
 
 ## Inference
 To evaluate the model of GTM-Transformer please use the following script .Please check the arguments inside the script before launch.
@@ -54,6 +57,21 @@ To evaluate the model of GTM-Transformer please use the following script .Please
 python forecast.py --data_folder dataset --ckpt_path ckpt/model.pth
 ```
 
+## Export Item Embedddings
+export：test
+```bash
+python export_item_embeddings.py --checkpoint "path/to/your.ckpt" --data_folder "dataset/" --split test --output_dir "outputs/"
+```
+
+export: train
+```bash
+python export_item_embeddings.py --checkpoint "path/to/your.ckpt" --data_folder "dataset/" --split train --output_dir "outputs/"
+```
+
+export: all
+```bash
+python export_item_embeddings.py --checkpoint "path/to/your.ckpt" --data_folder "dataset/" --split all --output_dir "outputs/"
+```
 ## Citation
 ```
 @misc{skenderi2021googled,
