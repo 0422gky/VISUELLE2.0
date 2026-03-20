@@ -12,6 +12,17 @@ from sklearn.metrics import mean_absolute_error
 from pathlib import Path
 
 
+def _torch_load_trusted(path: Path):
+    """
+    PyTorch 2.6+ 默认 torch.load(weights_only=True) 会拒绝加载包含 numpy/非纯权重对象的 .pt。
+    本脚本用于加载 checkpoint/data dict，因此显式关闭 weights_only。
+    """
+    try:
+        return torch.load(str(path), map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(str(path), map_location="cpu")
+
+
 def cal_error_metrics(gt, forecasts):
     # Absolute errors
     mae = mean_absolute_error(gt, forecasts)
@@ -39,9 +50,9 @@ def run(args):
     item_codes = test_df['external_code'].values
 
      # Load category and color encodings
-    cat_dict = torch.load(Path(args.data_folder + 'category_labels.pt'))
-    col_dict = torch.load(Path(args.data_folder + 'color_labels.pt'))
-    fab_dict = torch.load(Path(args.data_folder + 'fabric_labels.pt'))
+    cat_dict = _torch_load_trusted(Path(args.data_folder + 'category_labels.pt'))
+    col_dict = _torch_load_trusted(Path(args.data_folder + 'color_labels.pt'))
+    fab_dict = _torch_load_trusted(Path(args.data_folder + 'fabric_labels.pt'))
 
     # Load Google trends
     gtrends = pd.read_csv(Path(args.data_folder + 'gtrends.csv'), index_col=[0], parse_dates=True)
@@ -89,23 +100,20 @@ def run(args):
             gpu_num=args.gpu_num
         )
     
-    model.load_state_dict(torch.load(args.ckpt_path)['state_dict'], strict=False)
+    ckpt = _torch_load_trusted(Path(args.ckpt_path))
+    model.load_state_dict(ckpt['state_dict'] if isinstance(ckpt, dict) and 'state_dict' in ckpt else ckpt, strict=False)
 
     # Forecast the testing set
     model.to(device)
     model.eval()
-    # --- add: 去除了这里的 attn ---
     gt, forecasts = [], []
     for test_data in tqdm(test_loader, total=len(test_loader), ascii=True):
         with torch.no_grad():
             test_data = [tensor.to(device) for tensor in test_data]
             item_sales, category, color, textures, temporal_features, gtrends, images =  test_data
-            # y_pred, att = model(category, color,textures, temporal_features, gtrends, images)
             y_pred = model(category, color, textures, temporal_features, gtrends, images)
-            # --- add --- 
             forecasts.append(y_pred.detach().cpu().numpy().flatten()[:args.output_dim])
             gt.append(item_sales.detach().cpu().numpy().flatten()[:args.output_dim])
-            # attns不要了
     forecasts = np.array(forecasts)
     gt = np.array(gt)
 
