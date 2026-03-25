@@ -33,8 +33,9 @@ def run(args):
     pl.seed_everything(args.seed)
 
     # Load sales data
-    train_df = pd.read_csv(Path(args.data_folder + 'train.csv'), parse_dates=['release_date'])
-    test_df = pd.read_csv(Path(args.data_folder + 'test.csv'), parse_dates=['release_date'])
+    # load only 5000 and 500 for fast experiment
+    train_df = pd.read_csv(Path(args.data_folder + 'train.csv'), parse_dates=['release_date'], nrows=5000)
+    test_df = pd.read_csv(Path(args.data_folder + 'test.csv'), parse_dates=['release_date'], nrows=500)
 
     # Load category and color encodings
     cat_dict = _torch_load_trusted(Path(args.data_folder + 'category_labels.pt'))

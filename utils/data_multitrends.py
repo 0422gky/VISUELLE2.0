@@ -34,8 +34,8 @@ class ZeroShotDataset():
         gtrends, image_features = [], []
         img_transforms = Compose([Resize((256, 256)), ToTensor(), Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
         for (idx, row) in tqdm(data.iterrows(), total=len(data), ascii=True):
-            cat, col, fab, fiq_attr, start_date, img_path = row['category'], row['color'], row['fabric'], row['extra'], \
-                row['release_date'], row['image_path']
+            cat, col, fab, start_date, img_path = row['category'], row['color'], row['fabric'], \
+                row['release_date'], row['image_path'] # remove row extra 
 
             # Get the gtrend signal up to the previous year (52 weeks) of the release date
             gtrend_start = start_date - pd.DateOffset(weeks=52)
@@ -60,11 +60,11 @@ class ZeroShotDataset():
         gtrends = np.array(gtrends)
 
         # Remove non-numerical information
-        data.drop(['external_code', 'season', 'release_date', 'image_path'], axis=1, inplace=True)
+        data.drop(['external_code', 'season', 'release_date', 'image_path', 'retail'], axis=1, inplace=True)
 
         # Create tensors for each part of the input/output
-        item_sales, temporal_features = torch.FloatTensor(data.iloc[:, :12].values), torch.FloatTensor(
-            data.iloc[:, 13:17].values)
+        temporal_features, item_sales = torch.FloatTensor(data.iloc[:, :-12].values), torch.FloatTensor(
+            data.iloc[:, -12:].values)
         categories, colors, fabrics = [self.cat_dict[val] for val in data.iloc[:].category.values], \
                                        [self.col_dict[val] for val in data.iloc[:].color.values], \
                                        [self.fab_dict[val] for val in data.iloc[:].fabric.values]

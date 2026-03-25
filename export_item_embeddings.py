@@ -53,6 +53,7 @@ def _read_split_df(data_folder: str, split: str) -> pd.DataFrame:
 
 def _prepare_metadata_df(df: pd.DataFrame, split_value: str) -> pd.DataFrame:
     meta_cols = [
+        "retail",
         "external_code",
         "season",
         "category",

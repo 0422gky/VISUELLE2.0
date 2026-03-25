@@ -47,7 +47,7 @@ python train.py --data_folder dataset
 ```
 
 ```bash
-python train.py --data_folder "./" --gpu_num 0 --model_type GTM
+python train.py --data_folder "visuelle2/" --gpu_num 0 --model_type GTM
 ```
 
 ## Inference
