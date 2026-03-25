@@ -59,12 +59,37 @@ class ZeroShotDataset():
         # Convert to numpy arrays
         gtrends = np.array(gtrends)
 
-        # Remove non-numerical information
-        data.drop(['external_code', 'season', 'release_date', 'image_path', 'retail'], axis=1, inplace=True)
+        # DummyEmbedder expects 5 numeric inputs: day, week, month, year, restock (each embedded via Linear(1, dim); see DummyEmbedder).
+        # New CSVs keep category/color/fabric as strings and use release_date instead of precomputed d/w/m/y.
+        rd = pd.to_datetime(data['release_date'])
+        if hasattr(rd.dt, 'isocalendar'):
+            week_num = rd.dt.isocalendar().week.to_numpy(dtype=np.float32)
+        else:
+            week_num = rd.dt.week.to_numpy(dtype=np.float32)
+        if 'restock' in data.columns:
+            restock_vals = pd.to_numeric(data['restock'], errors='coerce').fillna(0.0).to_numpy(dtype=np.float32)
+        else:
+            restock_vals = np.zeros(len(data), dtype=np.float32)
+        temporal_np = np.column_stack([
+            rd.dt.day.to_numpy(dtype=np.float32),
+            week_num,
+            rd.dt.month.to_numpy(dtype=np.float32),
+            rd.dt.year.to_numpy(dtype=np.float32),
+            restock_vals,
+        ])
 
-        # Create tensors for each part of the input/output
-        temporal_features, item_sales = torch.FloatTensor(data.iloc[:, :-12].values), torch.FloatTensor(
-            data.iloc[:, -12:].values)
+        # Remove non-numerical information (restock is copied into temporal_np above)
+        drop_cols = ['external_code', 'season', 'release_date', 'image_path', 'retail', 'restock']
+        data.drop([c for c in drop_cols if c in data.columns], axis=1, inplace=True)
+
+        # Last 12 numeric columns = weekly sales (e.g. columns "0".."11"); exclude strings like category/color/fabric.
+        num = data.select_dtypes(include=[np.number])
+        if num.shape[1] < 12:
+            raise ValueError(
+                f'Need at least 12 numeric sales columns at the end; got {num.shape[1]} numeric columns.'
+            )
+        item_sales = torch.tensor(num.iloc[:, -12:].to_numpy(dtype=np.float32))
+        temporal_features = torch.tensor(temporal_np, dtype=torch.float32)
         categories, colors, fabrics = [self.cat_dict[val] for val in data.iloc[:].category.values], \
                                        [self.col_dict[val] for val in data.iloc[:].color.values], \
                                        [self.fab_dict[val] for val in data.iloc[:].fabric.values]

@@ -52,28 +52,39 @@ def _read_split_df(data_folder: str, split: str) -> pd.DataFrame:
 
 
 def _prepare_metadata_df(df: pd.DataFrame, split_value: str) -> pd.DataFrame:
-    meta_cols = [
-        "retail",
+    """
+    与 ZeroShotDataset / VISUELLE2 CSV 对齐：元数据列按下列顺序导出「实际存在的」列。
+    新版数据通常含 external_code、restock、release_date 等，不再要求 CSV 内单独的 day/week/month/year
+    （时序标量由 preprocess_data 从 release_date + restock 构造为 5 维 temporal_features）。
+    旧版 GTM 若仍含 day/week/month/year/extra，也会一并导出。
+    """
+    preferred_order = [
         "external_code",
+        "retail",
         "season",
         "category",
+        "color",
+        "fabric",
+        "image_path",
         "release_date",
+        "restock",
         "day",
         "week",
         "month",
         "year",
-        "image_path",
-        "color",
-        "fabric",
         "extra",
     ]
-    missing = [c for c in meta_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"metadata columns missing in csv: {missing}")
+    meta_cols = [c for c in preferred_order if c in df.columns]
+    if not meta_cols:
+        raise ValueError(
+            "CSV has no metadata columns matching the known schema; "
+            f"expected at least one of: {', '.join(preferred_order)}"
+        )
 
     meta_df = df[meta_cols].copy()
-    # 要求 release_date 作为字符串保留
-    if np.issubdtype(meta_df["release_date"].dtype, np.datetime64):
+    if "release_date" in meta_df.columns and np.issubdtype(
+        meta_df["release_date"].dtype, np.datetime64
+    ):
         meta_df["release_date"] = meta_df["release_date"].dt.strftime("%Y-%m-%d")
     meta_df.insert(0, "split", split_value)
     meta_df = meta_df.reset_index(drop=True)
@@ -164,7 +175,7 @@ def export_for_df(
 
     for batch in loader:
         # TensorDataset item order:
-        # item_sales, categories, colors, fabrics, temporal_features, gtrends, images
+        # item_sales, categories, colors, fabrics, temporal_features (5: d,w,m,y,restock), gtrends, images
         item_sales, category, color, fabric, temporal_features, gtrends, images = batch
 
         # Move to device
