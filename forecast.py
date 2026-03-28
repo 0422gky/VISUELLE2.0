@@ -46,7 +46,8 @@ def run(args):
     pl.seed_everything(args.seed)
 
     # Load sales data    
-    test_df = pd.read_csv(Path(args.data_folder + 'test.csv'), parse_dates=['release_date'])
+    # laod only 500 rows for test df for fast experiment
+    test_df = pd.read_csv(Path(args.data_folder + 'test.csv'), parse_dates=['release_date'], nrows=500)
     item_codes = test_df['external_code'].values
 
      # Load category and color encodings
@@ -117,7 +118,7 @@ def run(args):
     forecasts = np.array(forecasts)
     gt = np.array(gt)
 
-    rescale_vals = np.load(args.data_folder + 'normalization_scale.npy')
+    rescale_vals = np.load(args.data_folder + 'stfore_sales_norm_scalar.npy')
     rescaled_forecasts = forecasts * rescale_vals
     rescaled_gt = gt * rescale_vals
     print_error_metrics(gt, forecasts, rescaled_gt, rescaled_forecasts)

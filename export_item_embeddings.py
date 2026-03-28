@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 from typing import Dict, Tuple, List
@@ -44,47 +45,26 @@ def _extract_hparams(ckpt: Dict) -> Dict:
     return {}
 
 
-def _read_split_df(data_folder: str, split: str) -> pd.DataFrame:
+def _read_split_df(data_folder: str, split: str, nrows: int | None = None) -> pd.DataFrame:
     csv_path = os.path.join(data_folder, f"{split}.csv")
     # parse_dates 用于满足 ZeroShotDataset.preprocess_data() 里的时间运算
-    df = pd.read_csv(csv_path, parse_dates=["release_date"])
+    df = pd.read_csv(csv_path, parse_dates=["release_date"], nrows=nrows)
     return df
 
 
-def _prepare_metadata_df(df: pd.DataFrame, split_value: str) -> pd.DataFrame:
+def _prepare_export_meta_df(df: pd.DataFrame, split_value: str) -> pd.DataFrame:
     """
-    与 ZeroShotDataset / VISUELLE2 CSV 对齐：元数据列按下列顺序导出「实际存在的」列。
-    新版数据通常含 external_code、restock、release_date 等，不再要求 CSV 内单独的 day/week/month/year
-    （时序标量由 preprocess_data 从 release_date + restock 构造为 5 维 temporal_features）。
-    旧版 GTM 若仍含 day/week/month/year/extra，也会一并导出。
+    导出 CSV 所需的元数据列（与 export_for_df 最终列一致，不含周销量与 embedding）。
     """
-    preferred_order = [
-        "external_code",
-        "retail",
-        "season",
-        "category",
-        "color",
-        "fabric",
-        "image_path",
-        "release_date",
-        "restock",
-        "day",
-        "week",
-        "month",
-        "year",
-        "extra",
-    ]
-    meta_cols = [c for c in preferred_order if c in df.columns]
-    if not meta_cols:
+    required = ["external_code", "retail", "restock", "release_date"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
         raise ValueError(
-            "CSV has no metadata columns matching the known schema; "
-            f"expected at least one of: {', '.join(preferred_order)}"
+            f"CSV 缺少导出所需列: {missing}；需要列: {required}"
         )
 
-    meta_df = df[meta_cols].copy()
-    if "release_date" in meta_df.columns and np.issubdtype(
-        meta_df["release_date"].dtype, np.datetime64
-    ):
+    meta_df = df[required].copy()
+    if np.issubdtype(meta_df["release_date"].dtype, np.datetime64):
         meta_df["release_date"] = meta_df["release_date"].dt.strftime("%Y-%m-%d")
     meta_df.insert(0, "split", split_value)
     meta_df = meta_df.reset_index(drop=True)
@@ -140,7 +120,7 @@ def export_for_df(
     args: argparse.Namespace,
     model: GTM,
 ) -> None:
-    meta_df = _prepare_metadata_df(df, split_name)
+    meta_df = _prepare_export_meta_df(df, split_name)
 
     # 用于模型的 df：preprocess_data 会 inplace drop 列，因此用副本
     df_for_model = df.copy(deep=True)
@@ -222,15 +202,15 @@ def export_for_df(
     if offset != n:
         raise RuntimeError(f"Export alignment error: processed_rows={offset}, expected_rows={n}")
 
-    # Build output dataframe
+    # Build output dataframe: split, external_code, retail, restock, release_date,
+    # sales_wk_0..11, embedding（单列，JSON 数组字符串）
     sales_cols = [f"sales_wk_{i}" for i in range(12)]
     sales_df = pd.DataFrame(sales_matrix, columns=sales_cols)
 
-    H = emb_matrix.shape[1]
-    emb_cols = [f"emb_{i:03d}" for i in range(H)]
-    emb_df = pd.DataFrame(emb_matrix, columns=emb_cols)
+    embedding_col = [json.dumps(row.tolist()) for row in emb_matrix]
+    emb_series = pd.Series(embedding_col, name="embedding")
 
-    final_df = pd.concat([meta_df, sales_df, emb_df], axis=1)
+    final_df = pd.concat([meta_df, sales_df, emb_series], axis=1)
 
     out_csv_name = f"{split_name}_item_embeddings.csv"
     out_npy_name = f"{split_name}_item_embeddings.npy"
@@ -248,7 +228,14 @@ def export_for_split(
     args: argparse.Namespace,
     model: GTM,
 ) -> None:
-    df = _read_split_df(args.data_folder, split_name)
+    # 仅导出前若干行，避免一次性处理过多数据导致 OOM
+    nrows = None
+    if split_name == "train":
+        nrows = 5000
+    elif split_name == "test":
+        nrows = 500
+
+    df = _read_split_df(args.data_folder, split_name, nrows=nrows)
     export_for_df(split_name=split_name, df=df, args=args, model=model)
 
 
@@ -340,8 +327,8 @@ def main():
     for sp in splits_to_run:
         if sp == "all":
             # 合并 train + test 并导出；外部要求 split 字段为 all
-            train_df = _read_split_df(args.data_folder, "train")
-            test_df = _read_split_df(args.data_folder, "test")
+            train_df = _read_split_df(args.data_folder, "train", nrows=5000)
+            test_df = _read_split_df(args.data_folder, "test", nrows=500)
             df_all = pd.concat([train_df, test_df], axis=0, ignore_index=True)
             export_for_df(split_name="all", df=df_all, args=args, model=model)
         else:

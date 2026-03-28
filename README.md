@@ -3,6 +3,15 @@ Official Pytorch Implementation of [**Well Googled is Half Done: Multimodal Fore
 
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/well-googled-is-half-done-multimodal/new-product-sales-forecasting-on-visuelle)](https://paperswithcode.com/sota/new-product-sales-forecasting-on-visuelle?p=well-googled-is-half-done-multimodal)
 
+## env settings
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+# 关闭wandb
+# 设置pip为镜像源
+tmux attach -t my_training_session
+```
+
+
 ## Installation
 
 We suggest the use of VirtualEnv.
@@ -55,6 +64,12 @@ To evaluate the model of GTM-Transformer please use the following script .Please
 
 ```bash
 python forecast.py --data_folder dataset --ckpt_path ckpt/model.pth
+
+python forecast.py --data_folder "visuelle2/" --ckpt_path "log/GTM/GTM_Run1---epoch=29---25-03-2026-13-17-24.ckpt"
+
+
+cd d:\Codefield\ds\VIS2\VISUELLE2.0
+python forecast.py --data_folder "visuelle2/" --ckpt_path "log/GTM/GTM_Run1---epoch=169---27-03-2026-11-28-07.ckpt" --output_dim 12 --gpu_num 0 --output_csv results/my_forecast.csv
 ```
 
 ## Export Item Embedddings
@@ -72,6 +87,14 @@ export: all
 ```bash
 python export_item_embeddings.py --checkpoint "path/to/your.ckpt" --data_folder "dataset/" --split all --output_dir "outputs/"
 ```
+
+```bash
+# example of ckpt path
+tmp_GTM_transformer/log/GTM/GTM_Run1---epoch=29---25-03-2026-13-17-24.ckpt
+
+python export_item_embeddings.py --checkpoint "log/GTM/GTM_Run1---epoch=29---25-03-2026-13-17-24.ckpt" --data_folder "visuelle2/" --split all --output_dir "outputs/"
+```
+
 ## Citation
 ```
 @misc{skenderi2021googled,
