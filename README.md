@@ -68,8 +68,17 @@ python forecast.py --data_folder dataset --ckpt_path ckpt/model.pth
 python forecast.py --data_folder "visuelle2/" --ckpt_path "log/GTM/GTM_Run1---epoch=29---25-03-2026-13-17-24.ckpt"
 
 
-cd d:\Codefield\ds\VIS2\VISUELLE2.0
-python forecast.py --data_folder "visuelle2/" --ckpt_path "log/GTM/GTM_Run1---epoch=169---27-03-2026-11-28-07.ckpt" --output_dim 12 --gpu_num 0 --output_csv results/my_forecast.csv
+python forecast_csv.py --data_folder "visuelle2/" --ckpt_path "log/GTM/GTM_Run1---epoch=169---27-03-2026-11-28-07.ckpt" --output_dim 12 --gpu_num 0 --output_csv results/my_forecast.csv
+
+
+cd /data/coding/tmp_GTM_transformer
+python similarity_wape_pipeline.py \
+  --train_csv outputs/train_item_embeddings.csv \
+  --test_csv outputs/test_item_embeddings.csv \
+  --top_k 20 \
+  --start_week 2 \
+  --save_prefix results/sim_wape \
+  --compare_topk 1,5,20
 ```
 
 ## Export Item Embedddings
