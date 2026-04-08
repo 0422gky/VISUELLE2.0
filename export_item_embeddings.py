@@ -1,5 +1,4 @@
 import argparse
-import json
 import os
 import sys
 from typing import Dict, Tuple, List
@@ -14,7 +13,11 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from models.GTM import GTM
-from utils.data_multitrends import ZeroShotDataset
+from utils.data_multitrends import (
+    LazyZeroShotDataset,
+    ZeroShotDataset,
+    collate_lazy_zeroshot_batch,
+)
 
 
 def _torch_load_trusted(path: str):
@@ -45,26 +48,106 @@ def _extract_hparams(ckpt: Dict) -> Dict:
     return {}
 
 
-def _read_split_df(data_folder: str, split: str, nrows: int | None = None) -> pd.DataFrame:
+def _read_split_df(data_folder: str, split: str) -> pd.DataFrame:
     csv_path = os.path.join(data_folder, f"{split}.csv")
     # parse_dates 用于满足 ZeroShotDataset.preprocess_data() 里的时间运算
-    df = pd.read_csv(csv_path, parse_dates=["release_date"], nrows=nrows)
+    df = pd.read_csv(csv_path, parse_dates=["release_date"])
     return df
 
 
-def _prepare_export_meta_df(df: pd.DataFrame, split_value: str) -> pd.DataFrame:
-    """
-    导出 CSV 所需的元数据列（与 export_for_df 最终列一致，不含周销量与 embedding）。
-    """
-    required = ["external_code", "retail", "restock", "release_date"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(
-            f"CSV 缺少导出所需列: {missing}；需要列: {required}"
+def sample_train_df(df: pd.DataFrame, train_frac: float, seed: int) -> pd.DataFrame:
+    """与 train.py 一致：仅对 train 子集抽样。"""
+    if not (0.0 < train_frac <= 1.0):
+        raise ValueError(f"train_frac must be in (0, 1], got {train_frac}")
+    if train_frac < 1.0:
+        return df.sample(frac=train_frac, random_state=seed).reset_index(drop=True)
+    return df.reset_index(drop=True)
+
+
+def _release_date_slash(val) -> str:
+    ts = pd.to_datetime(val)
+    return f"{int(ts.year)}/{int(ts.month)}/{int(ts.day)}"
+
+
+def _build_compact_dataframe(
+    df: pd.DataFrame,
+    sales_matrix: np.ndarray,
+    emb_matrix: np.ndarray,
+    split_name: str,
+) -> pd.DataFrame:
+    """紧凑列：train_* / test_*；split_name=='all' 时为 split + code + …"""
+    n = len(df)
+    if sales_matrix.shape != (n, 12):
+        raise ValueError(f"sales_matrix shape {sales_matrix.shape} != ({n}, 12)")
+    if emb_matrix.shape[0] != n:
+        raise ValueError(f"emb_matrix rows {emb_matrix.shape[0]} != {n}")
+    if "external_code" not in df.columns:
+        raise ValueError("compact format requires column 'external_code' in CSV")
+
+    codes = df["external_code"].values
+    if "retail" in df.columns:
+        retail = df["retail"].values
+    else:
+        retail = np.full(n, np.nan, dtype=np.float64)
+    if "restock" in df.columns:
+        restock = df["restock"].values
+    else:
+        restock = np.full(n, np.nan, dtype=np.float64)
+
+    release_dates = df["release_date"].map(_release_date_slash)
+    # 每行一列：Python list[float]，非 JSON 字符串（DataFrame 列为 object）
+    curves = [sales_matrix[i].astype(np.float64, copy=False).tolist() for i in range(n)]
+    embs = [emb_matrix[i].astype(np.float64, copy=False).tolist() for i in range(n)]
+
+    if split_name == "all":
+        if "_compact_split" not in df.columns:
+            raise ValueError("split=all compact export requires internal column _compact_split")
+        return pd.DataFrame(
+            {
+                "split": df["_compact_split"].astype(str).values,
+                "code": codes,
+                "retail": retail,
+                "curve": curves,
+                "restock": restock,
+                "release_date": release_dates,
+                "emb": embs,
+            }
         )
 
-    meta_df = df[required].copy()
-    if np.issubdtype(meta_df["release_date"].dtype, np.datetime64):
+    prefix = split_name
+    return pd.DataFrame(
+        {
+            f"{prefix}_code": codes,
+            f"{prefix}_retail": retail,
+            f"{prefix}_curve": curves,
+            f"{prefix}_restock": restock,
+            f"{prefix}_release_date": release_dates,
+            f"{prefix}_emb": embs,
+        }
+    )
+
+
+_WEEK_COLS = [str(i) for i in range(12)]
+
+
+def _prepare_metadata_df(df: pd.DataFrame, split_value: str) -> pd.DataFrame:
+    """
+    导出元数据：与数据 CSV 一致，只去掉 12 周销量列 '0'..'11'（避免与导出的 sales_wk_* 重复）。
+    visuelle2：external_code, retail, season, category, color, image_path, fabric, release_date, restock。
+    旧版 train：可仍含 day/week/month/year/extra（若 CSV 里有）。
+    """
+    meta_cols = [
+        c
+        for c in df.columns
+        if c not in _WEEK_COLS and c != "_compact_split"
+    ]
+    if not meta_cols:
+        raise ValueError("No metadata columns after excluding week columns '0'..'11'")
+
+    meta_df = df[meta_cols].copy()
+    if "release_date" in meta_df.columns and np.issubdtype(
+        meta_df["release_date"].dtype, np.datetime64
+    ):
         meta_df["release_date"] = meta_df["release_date"].dt.strftime("%Y-%m-%d")
     meta_df.insert(0, "split", split_value)
     meta_df = meta_df.reset_index(drop=True)
@@ -120,30 +203,49 @@ def export_for_df(
     args: argparse.Namespace,
     model: GTM,
 ) -> None:
-    meta_df = _prepare_export_meta_df(df, split_name)
+    output_format = getattr(args, "output_format", "compact")
 
     # 用于模型的 df：preprocess_data 会 inplace drop 列，因此用副本
     df_for_model = df.copy(deep=True)
 
-    dataset = ZeroShotDataset(
-        data_df=df_for_model,
-        img_root=os.path.join(args.data_folder, "images"),
-        gtrends=args.gtrends,
-        cat_dict=args.cat_dict,
-        col_dict=args.col_dict,
-        fab_dict=args.fab_dict,
-        trend_len=args.trend_len,
-    )
-
-    # 复用原项目 preprocessing（它会一次性把 images/gtrends/gtrend 缓存在 TensorDataset 里）
-    tensor_dataset = dataset.preprocess_data()
-
-    loader = DataLoader(
-        tensor_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,  # 禁止 shuffle，确保 tensor 顺序与 meta_df 行顺序严格对齐
-        num_workers=args.num_workers,
-    )
+    use_lazy = bool(getattr(args, "lazy_loader", 1))
+    if use_lazy:
+        # 与 preprocess_data 逐样本一致，峰值内存随 batch 而非全表
+        ds = LazyZeroShotDataset(
+            data_df=df_for_model,
+            img_root=os.path.join(args.data_folder, "images"),
+            gtrends=args.gtrends,
+            cat_dict=args.cat_dict,
+            col_dict=args.col_dict,
+            fab_dict=args.fab_dict,
+            trend_len=args.trend_len,
+        )
+        # default_collate 的 resize_ 在部分环境下会报 storage not resizable；用 stack collate
+        loader = DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=False,
+            collate_fn=collate_lazy_zeroshot_batch,
+        )
+    else:
+        dataset = ZeroShotDataset(
+            data_df=df_for_model,
+            img_root=os.path.join(args.data_folder, "images"),
+            gtrends=args.gtrends,
+            cat_dict=args.cat_dict,
+            col_dict=args.col_dict,
+            fab_dict=args.fab_dict,
+            trend_len=args.trend_len,
+        )
+        tensor_dataset = dataset.preprocess_data()
+        loader = DataLoader(
+            tensor_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+        )
 
     n = len(df_for_model)
     emb_matrix = None  # (N, H)
@@ -155,11 +257,12 @@ def export_for_df(
 
     for batch in loader:
         # TensorDataset item order:
-        # item_sales, categories, colors, fabrics, temporal_features (5: d,w,m,y,restock), gtrends, images
-        item_sales, category, color, fabric, temporal_features, gtrends, images = batch
+        # item_sales, recent_sales_2w, categories, colors, fabrics, temporal_features, gtrends, images
+        item_sales, recent_sales_2w, category, color, fabric, temporal_features, gtrends, images = batch
 
         # Move to device
         item_sales = item_sales.to(args.device)
+        recent_sales_2w = recent_sales_2w.to(args.device)
         category = category.to(args.device)
         color = color.to(args.device)
         fabric = fabric.to(args.device)
@@ -174,6 +277,7 @@ def export_for_df(
             temporal_features,
             gtrends,
             images,
+            recent_sales_2w=recent_sales_2w,
             return_embedding=True,
         )
         # fused_feature: decoder cross-attn output
@@ -202,24 +306,42 @@ def export_for_df(
     if offset != n:
         raise RuntimeError(f"Export alignment error: processed_rows={offset}, expected_rows={n}")
 
-    # Build output dataframe: split, external_code, retail, restock, release_date,
-    # sales_wk_0..11, embedding（单列，JSON 数组字符串）
-    sales_cols = [f"sales_wk_{i}" for i in range(12)]
-    sales_df = pd.DataFrame(sales_matrix, columns=sales_cols)
-
-    embedding_col = [json.dumps(row.tolist()) for row in emb_matrix]
-    emb_series = pd.Series(embedding_col, name="embedding")
-
-    final_df = pd.concat([meta_df, sales_df, emb_series], axis=1)
-
-    out_csv_name = f"{split_name}_item_embeddings.csv"
-    out_npy_name = f"{split_name}_item_embeddings.npy"
-    out_meta_csv_name = f"{split_name}_item_embedding_meta.csv"
-
     os.makedirs(args.output_dir, exist_ok=True)
-    final_df.to_csv(os.path.join(args.output_dir, out_csv_name), index=False)
-    np.save(os.path.join(args.output_dir, out_npy_name), emb_matrix)
-    pd.concat([meta_df, sales_df], axis=1).to_csv(os.path.join(args.output_dir, out_meta_csv_name), index=False)
+    base = f"{split_name}_item_embeddings"
+    out_dir = args.output_dir
+    npy_path = os.path.join(out_dir, f"{base}.npy")
+    np.save(npy_path, emb_matrix)
+
+    if output_format in ("compact", "both"):
+        compact_df = _build_compact_dataframe(df, sales_matrix, emb_matrix, split_name)
+        storage = getattr(args, "compact_storage", "parquet")
+        if storage == "parquet":
+            compact_path = os.path.join(out_dir, f"{base}.parquet")
+            try:
+                compact_df.to_parquet(compact_path, index=False, engine="pyarrow")
+            except ImportError as e:
+                raise RuntimeError(
+                    "紧凑导出 Parquet 需要 pyarrow：pip install pyarrow；或改用 --compact_storage csv"
+                ) from e
+            print(f"[{split_name}] wrote compact Parquet: {compact_path}")
+        else:
+            compact_path = os.path.join(out_dir, f"{base}.csv")
+            compact_df.to_csv(compact_path, index=False)
+            print(f"[{split_name}] wrote compact CSV: {compact_path}")
+
+    if output_format in ("wide", "both"):
+        meta_df = _prepare_metadata_df(df, split_name)
+        sales_cols = [f"sales_wk_{i}" for i in range(12)]
+        sales_df = pd.DataFrame(sales_matrix, columns=sales_cols)
+        H = emb_matrix.shape[1]
+        emb_cols = [f"emb_{i:03d}" for i in range(H)]
+        emb_df = pd.DataFrame(emb_matrix, columns=emb_cols)
+        final_wide = pd.concat([meta_df, sales_df, emb_df], axis=1)
+        wide_csv = os.path.join(out_dir, f"{base}_wide.csv")
+        meta_csv = os.path.join(out_dir, f"{base}_meta.csv")
+        final_wide.to_csv(wide_csv, index=False)
+        pd.concat([meta_df, sales_df], axis=1).to_csv(meta_csv, index=False)
+        print(f"[{split_name}] wrote wide CSV: {wide_csv}")
 
 
 @torch.no_grad()
@@ -228,14 +350,9 @@ def export_for_split(
     args: argparse.Namespace,
     model: GTM,
 ) -> None:
-    # 仅导出前若干行，避免一次性处理过多数据导致 OOM
-    nrows = None
+    df = _read_split_df(args.data_folder, split_name)
     if split_name == "train":
-        nrows = 5000
-    elif split_name == "test":
-        nrows = 500
-
-    df = _read_split_df(args.data_folder, split_name, nrows=nrows)
+        df = sample_train_df(df, args.train_frac, args.seed)
     export_for_df(split_name=split_name, df=df, args=args, model=model)
 
 
@@ -263,8 +380,48 @@ def main():
     parser.add_argument("--num_trends", type=int, default=3)
     parser.add_argument("--use_encoder_mask", type=int, default=1)
     parser.add_argument("--autoregressive", type=int, default=0)
+    parser.add_argument(
+        "--use_hist_sales",
+        type=int,
+        default=0,
+        help="与训练 GTM 一致；checkpoint 含 hyper_parameters 时以 ckpt 为准",
+    )
+    parser.add_argument(
+        "--lazy_loader",
+        type=int,
+        default=1,
+        help="1=按样本惰性加载 gtrends+图像（大表省内存，与 preprocess 单样本逻辑一致）；0=原 preload 全表",
+    )
+    parser.add_argument(
+        "--train_frac",
+        type=float,
+        default=1.0,
+        help="与 train.py 一致：仅对 train.csv 抽样后再导出；test 不受影响。",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=21,
+        help="train_frac 抽样用 random_state，与 train.py --seed 一致。",
+    )
+    parser.add_argument(
+        "--output_format",
+        type=str,
+        default="compact",
+        choices=["compact", "wide", "both"],
+        help="compact=紧凑表+np y（默认）；wide=原宽表 emb_000+sales_wk；both=两种都写",
+    )
+    parser.add_argument(
+        "--compact_storage",
+        type=str,
+        default="parquet",
+        choices=["parquet", "csv"],
+        help="紧凑表落盘格式：parquet（默认，保留 list 列类型，需 pyarrow）；csv 为文本表",
+    )
 
     args = parser.parse_args()
+    if not (0.0 < args.train_frac <= 1.0):
+        raise ValueError(f"--train_frac must be in (0, 1], got {args.train_frac}")
 
     # device
     if args.device.startswith("cuda") and not torch.cuda.is_available():
@@ -295,6 +452,16 @@ def main():
     def get_h(k, default):
         return hparams.get(k, default)
 
+    if hparams.get("train_frac") is not None and abs(
+        float(hparams["train_frac"]) - float(args.train_frac)
+    ) > 1e-9:
+        print(
+            f"Note: checkpoint hyper_parameters train_frac={hparams['train_frac']} "
+            f"!= CLI --train_frac={args.train_frac}"
+        )
+    if hparams.get("seed") is not None and int(hparams["seed"]) != int(args.seed):
+        print(f"Note: checkpoint hyper_parameters seed={hparams['seed']} != CLI --seed={args.seed}")
+
     model = GTM(
         embedding_dim=get_h("embedding_dim", args.embedding_dim),
         hidden_dim=get_h("hidden_dim", args.hidden_dim),
@@ -311,6 +478,7 @@ def main():
         gpu_num=args.gpu_num,
         use_encoder_mask=get_h("use_encoder_mask", args.use_encoder_mask),
         autoregressive=get_h("autoregressive", args.autoregressive),
+        use_hist_sales=get_h("use_hist_sales", args.use_hist_sales),
     )
     model.to(args.device)
     _load_checkpoint(model, args.checkpoint)
@@ -326,9 +494,13 @@ def main():
 
     for sp in splits_to_run:
         if sp == "all":
-            # 合并 train + test 并导出；外部要求 split 字段为 all
-            train_df = _read_split_df(args.data_folder, "train", nrows=5000)
-            test_df = _read_split_df(args.data_folder, "test", nrows=500)
+            train_df = _read_split_df(args.data_folder, "train")
+            train_df = sample_train_df(train_df, args.train_frac, args.seed)
+            test_df = _read_split_df(args.data_folder, "test")
+            train_df = train_df.copy()
+            test_df = test_df.copy()
+            train_df["_compact_split"] = "train"
+            test_df["_compact_split"] = "test"
             df_all = pd.concat([train_df, test_df], axis=0, ignore_index=True)
             export_for_df(split_name="all", df=df_all, args=args, model=model)
         else:
@@ -339,3 +511,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

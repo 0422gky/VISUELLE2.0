@@ -176,18 +176,43 @@ class DummyEmbedder(nn.Module):
         self.week_embedding = nn.Linear(1, embedding_dim)
         self.month_embedding = nn.Linear(1, embedding_dim)
         self.year_embedding = nn.Linear(1, embedding_dim)
-        self.restock_embedding = nn.Linear(1, embedding_dim)
+        self.aux_embedding = nn.Linear(1, embedding_dim)
         self.dummy_fusion = nn.Linear(embedding_dim * 5, embedding_dim)
         self.dropout = nn.Dropout(0.2)
 
 
     def forward(self, temporal_features):
-        # Temporal dummy variables (day, week, month, year) + restock (same per-scalar Linear as above)
-        d, w, m, y, r = temporal_features[:, 0].unsqueeze(1), temporal_features[:, 1].unsqueeze(1), \
-            temporal_features[:, 2].unsqueeze(1), temporal_features[:, 3].unsqueeze(1), temporal_features[:, 4].unsqueeze(1)
-        d_emb, w_emb, m_emb, y_emb, r_emb = self.day_embedding(d), self.week_embedding(w), self.month_embedding(m), \
-            self.year_embedding(y), self.restock_embedding(r)
-        temporal_embeddings = self.dummy_fusion(torch.cat([d_emb, w_emb, m_emb, y_emb, r_emb], dim=1))
+        # Temporal: day, week, month, year, aux (restock / extra / 0)
+        if temporal_features.shape[1] == 4:
+            temporal_features = torch.cat(
+                [
+                    temporal_features,
+                    torch.zeros(
+                        temporal_features.shape[0],
+                        1,
+                        device=temporal_features.device,
+                        dtype=temporal_features.dtype,
+                    ),
+                ],
+                dim=1,
+            )
+        d, w, m, y, a = (
+            temporal_features[:, 0].unsqueeze(1),
+            temporal_features[:, 1].unsqueeze(1),
+            temporal_features[:, 2].unsqueeze(1),
+            temporal_features[:, 3].unsqueeze(1),
+            temporal_features[:, 4].unsqueeze(1),
+        )
+        d_emb, w_emb, m_emb, y_emb, a_emb = (
+            self.day_embedding(d),
+            self.week_embedding(w),
+            self.month_embedding(m),
+            self.year_embedding(y),
+            self.aux_embedding(a),
+        )
+        temporal_embeddings = self.dummy_fusion(
+            torch.cat([d_emb, w_emb, m_emb, y_emb, a_emb], dim=1)
+        )
         temporal_embeddings = self.dropout(temporal_embeddings)
 
         return temporal_embeddings
@@ -250,7 +275,7 @@ class FCN(pl.LightningModule):
         return optimizer
 
     def training_step(self, train_batch, batch_idx):
-        item_sales, category, color, fabric, temporal_features, gtrends, images = train_batch 
+        item_sales, _recent_sales_2w, category, color, fabric, temporal_features, gtrends, images = train_batch
         forecasted_sales = self.forward(category, color, fabric, temporal_features, gtrends, images)
         forecasting_loss = F.mse_loss(item_sales, forecasted_sales.squeeze())
         loss = forecasting_loss
@@ -259,7 +284,7 @@ class FCN(pl.LightningModule):
         return loss
 
     def validation_step(self, val_batch, batch_idx):
-        item_sales, category, color, fabric, temporal_features, gtrends, images = val_batch 
+        item_sales, _recent_sales_2w, category, color, fabric, temporal_features, gtrends, images = val_batch
         forecasted_sales = self.forward(category, color, fabric, temporal_features, gtrends, images)
         
         return item_sales.squeeze(), forecasted_sales.squeeze()

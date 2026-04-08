@@ -11,6 +11,10 @@ export HF_ENDPOINT=https://hf-mirror.com
 tmux attach -t my_training_session
 ```
 
+## 使用了全部`train`的ckpt
+```
+/data/coding/tmp_GTM_transformer/log/GTM/GTM_Run1---epoch=104---02-04-2026-21-00-31.ckpt
+```
 
 ## Installation
 
@@ -56,7 +60,7 @@ python train.py --data_folder dataset
 ```
 
 ```bash
-python train.py --data_folder "visuelle2/" --gpu_num 0 --model_type GTM
+python train.py --data_folder "visuelle2/" --gpu_num 0 --model_type GTM --train_frac 1
 ```
 
 ## Inference
@@ -70,6 +74,10 @@ python forecast.py --data_folder "visuelle2/" --ckpt_path "log/GTM/GTM_Run1---ep
 
 python forecast_csv.py --data_folder "visuelle2/" --ckpt_path "log/GTM/GTM_Run1---epoch=169---27-03-2026-11-28-07.ckpt" --output_dim 12 --gpu_num 0 --output_csv results/my_forecast.csv
 
+
+python forecast_csv.py --data_folder "visuelle2/" --ckpt_path "log/GTM/GTM_Run1---epoch=44---31-03-2026-13-15-01.ckpt" --output_dim 12 --gpu_num 0 --output_csv results/my_forecast.csv
+
+python forecast_csv.py --data_folder "visuelle2/" --ckpt_path "log/GTM/GTM_Run1---epoch=104---02-04-2026-21-00-31.ckpt" --output_dim 12 --gpu_num 0 --output_csv results/my_forecast.csv
 
 cd /data/coding/tmp_GTM_transformer
 python similarity_wape_pipeline.py \
@@ -102,6 +110,8 @@ python export_item_embeddings.py --checkpoint "path/to/your.ckpt" --data_folder 
 tmp_GTM_transformer/log/GTM/GTM_Run1---epoch=29---25-03-2026-13-17-24.ckpt
 
 python export_item_embeddings.py --checkpoint "log/GTM/GTM_Run1---epoch=29---25-03-2026-13-17-24.ckpt" --data_folder "visuelle2/" --split all --output_dir "outputs/"
+
+python export_item_embeddings.py --checkpoint "log/GTM/GTM_Run1---epoch=104---02-04-2026-21-00-31.ckpt" --data_folder "visuelle2/" --split all --output_dir "outputs/"
 ```
 
 ## Citation
@@ -112,4 +122,43 @@ python export_item_embeddings.py --checkpoint "log/GTM/GTM_Run1---epoch=29---25-
       year={2021},
       eprint={2109.09824},
 }
+```
+
+## 对比学习 metric learning projector
+```bash
+# 1) 在 GTM-Transformer 目录，用已导出的 train 向量训练（曲线与 npy 行对齐，如 train.csv 或带 sales_wk_* 的导出表）
+python train_curve_projector.py --train_embeddings_npy outputs/train_item_embeddings.npy --train_curves_csv outputs/train_item_embeddings.parquet --output_dir results/curve_projector --epochs 20 --pca_components 0 
+
+# 2) 生成投影后的 train/test npy
+python apply_curve_projector.py --projector_dir results/curve_projector --train_embeddings_npy outputs/train_item_embeddings.npy  --test_embeddings_npy outputs/test_item_embeddings.npy --output_dir results/curve_projector/projected
+
+# 3) WAPE（ GTM-Transformer 下用 run_similarity_wape_with_projected.py） 这个是使用了对比学习的metric
+python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.parquet --test_csv outputs/test_item_embeddings.parquet   --train_emb_npy results/curve_projector/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector/WAPE_results
+
+
+# 不使用对比学习trick跑的 WAPE
+python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.parquet --test_csv outputs/test_item_embeddings.parquet   --train_emb_npy outputs/train_item_embeddings.npy   --test_emb_npy outputs/test_item_embeddings.npy --save_prefix results/curve_nonprojected/WAPE_results
+```
+
+
+## 带有PCA的projector
+
+```bash
+python train_curve_projector.py \
+  --train_embeddings_npy outputs/train_item_embeddings.npy \
+  --train_curves_csv outputs/train_item_embeddings.parquet \
+  --output_dir results/curve_projector_pca \
+  --pca_components 32 \
+  --epochs 20
+
+
+python apply_curve_projector.py \
+  --projector_dir results/curve_projector_pca \
+  --train_embeddings_npy outputs/train_item_embeddings.npy \
+  --test_embeddings_npy outputs/test_item_embeddings.npy \
+  --output_dir results/curve_projector_pca/projected \
+  --device cuda
+
+python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.parquet --test_csv outputs/test_item_embeddings.parquet   --train_emb_npy results/curve_projector_pca/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector_pca/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector_pca/WAPE_results
+
 ```

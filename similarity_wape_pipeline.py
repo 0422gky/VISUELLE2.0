@@ -207,34 +207,149 @@ def _parse_embedding_cell(value) -> np.ndarray:
     raise ValueError(f"无法解析 embedding 值类型: {type(value)}")
 
 
-def prepare_input_from_csv(
-    csv_path: str,
+def attach_embeddings_from_npy(df: pd.DataFrame, emb_npy: str | np.ndarray) -> pd.DataFrame:
+    """
+    Replace `embedding` column with rows from a (N, D) array; row order must match df.
+    Use after prepare_input_from_csv to inject metric-learning projected embeddings.
+    If the array has more rows than df (e.g. df was truncated with nrows), uses emb[: len(df)].
+    """
+    emb = np.load(emb_npy) if isinstance(emb_npy, str) else np.asarray(emb_npy)
+    n_df = len(df)
+    if len(emb) < n_df:
+        raise ValueError(
+            f"Row count mismatch: dataframe has {n_df} rows, embedding array has only {len(emb)}"
+        )
+    if len(emb) > n_df:
+        emb = emb[:n_df]
+    out = df.copy()
+    out["embedding"] = [emb[i].astype(np.float64, copy=False) for i in range(n_df)]
+    return out
+
+
+def _parse_curve_cell(value) -> np.ndarray:
+    """将 curve 单元格解析为 np.ndarray。"""
+    if isinstance(value, np.ndarray):
+        return value.astype(float)
+    if isinstance(value, list):
+        return np.asarray(value, dtype=float)
+    if isinstance(value, str):
+        return np.asarray(ast.literal_eval(value), dtype=float)
+    raise ValueError(f"无法解析 curve 值类型: {type(value)}")
+
+
+def sample_train_df(df: pd.DataFrame, train_frac: float, seed: int) -> pd.DataFrame:
+    """与 export_item_embeddings / train.py 一致：仅对 train 子集抽样。"""
+    if not (0.0 < train_frac <= 1.0):
+        raise ValueError(f"train_frac must be in (0, 1], got {train_frac}")
+    if train_frac < 1.0:
+        return df.sample(frac=train_frac, random_state=seed).reset_index(drop=True)
+    return df.reset_index(drop=True)
+
+
+def _read_table(path: str, nrows: int | None = None) -> pd.DataFrame:
+    read_kw: dict = {}
+    if nrows is not None:
+        read_kw["nrows"] = int(nrows)
+    if path.lower().endswith(".parquet"):
+        if nrows is not None:
+            # pandas 的 read_parquet 不支持 nrows；这里先全读后截断
+            return pd.read_parquet(path).head(int(nrows))
+        return pd.read_parquet(path)
+    return pd.read_csv(path, **read_kw)
+
+
+def _pick_prefixed_cols(df: pd.DataFrame) -> tuple[str, str, str, str] | None:
+    """
+    兼容 compact split 表:
+    - train_code, train_retail, train_curve, train_emb
+    - test_code, test_retail, test_curve, test_emb
+    """
+    for col in df.columns:
+        if not col.endswith("_code"):
+            continue
+        prefix = col[: -len("_code")]
+        c_code = f"{prefix}_code"
+        c_retail = f"{prefix}_retail"
+        c_curve = f"{prefix}_curve"
+        c_emb = f"{prefix}_emb"
+        if all(c in df.columns for c in [c_code, c_retail, c_curve, c_emb]):
+            return c_code, c_retail, c_curve, c_emb
+    return None
+
+
+def prepare_input_from_file(
+    path: str,
     embedding_col: str = "embedding",
     sales_prefix: str = "sales_wk_",
+    nrows: int | None = None,
+    sample_frac: float | None = None,
+    sample_seed: int = 21,
 ) -> pd.DataFrame:
     """
     读取 embedding CSV，并生成标准输入列:
     [external_code, retail, embedding, curve]
+    nrows: 若给定，在抽样之后（若有）再只保留前 n 行（便于快速测试）。
+    sample_frac: 若 <1，先全表读入再按 frac 抽样（需与 export_item_embeddings 的 train_frac/seed 一致）；
+                 已导出的对齐表请保持 None 或 1.0。
     """
-    df = pd.read_csv(csv_path)
-
-    required = {"external_code", "retail", embedding_col}
-    miss = required - set(df.columns)
-    if miss:
-        raise ValueError(f"{csv_path} 缺少列: {sorted(miss)}")
-
-    week_cols = sorted(
-        [c for c in df.columns if c.startswith(sales_prefix)],
-        key=lambda x: int(x.replace(sales_prefix, "")),
-    )
-    if not week_cols:
-        raise ValueError(f"{csv_path} 中未找到 `{sales_prefix}*` 列。")
+    if sample_frac is not None and sample_frac < 1.0:
+        df = _read_table(path, nrows=None)
+        df = sample_train_df(df, sample_frac, sample_seed)
+        if nrows is not None:
+            df = df.head(int(nrows)).reset_index(drop=True)
+    else:
+        df = _read_table(path, nrows=nrows)
 
     out = df.copy()
-    out["embedding"] = out[embedding_col].apply(_parse_embedding_cell)
-    out["curve"] = out[week_cols].astype(float).values.tolist()
-    out = out[["external_code", "retail", "embedding", "curve"]].copy()
-    return out
+
+    # 1) 标准列 / compact(all) 列
+    if {"external_code", "retail"}.issubset(out.columns):
+        code_col, retail_col = "external_code", "retail"
+        if embedding_col in out.columns:
+            emb_col = embedding_col
+        elif "emb" in out.columns:
+            emb_col = "emb"
+        else:
+            emb_cols = [c for c in out.columns if c.startswith("emb_")]
+            if not emb_cols:
+                raise ValueError(f"{path} 缺少 embedding 列（`{embedding_col}` / `emb` / `emb_*`）。")
+            emb_cols = sorted(emb_cols)
+            out["embedding"] = out[emb_cols].astype(float).values.tolist()
+            emb_col = "embedding"
+
+        if "curve" in out.columns:
+            curve_col = "curve"
+        else:
+            week_cols = sorted(
+                [c for c in out.columns if c.startswith(sales_prefix)],
+                key=lambda x: int(x.replace(sales_prefix, "")),
+            )
+            if not week_cols:
+                raise ValueError(f"{path} 缺少 curve 列（`curve` / `{sales_prefix}*`）。")
+            out["curve"] = out[week_cols].astype(float).values.tolist()
+            curve_col = "curve"
+
+        out["embedding"] = out[emb_col].apply(_parse_embedding_cell)
+        out["curve"] = out[curve_col].apply(_parse_curve_cell)
+        out = out[[code_col, retail_col, "embedding", "curve"]].copy()
+        out.rename(columns={code_col: "external_code", retail_col: "retail"}, inplace=True)
+        return out
+
+    # 2) compact split 前缀列 (train_*/test_*)
+    picked = _pick_prefixed_cols(out)
+    if picked is not None:
+        code_col, retail_col, curve_col, emb_col = picked
+        out["embedding"] = out[emb_col].apply(_parse_embedding_cell)
+        out["curve"] = out[curve_col].apply(_parse_curve_cell)
+        out = out[[code_col, retail_col, "embedding", "curve"]].copy()
+        out.rename(columns={code_col: "external_code", retail_col: "retail"}, inplace=True)
+        return out
+
+    raise ValueError(
+        f"{path} 的列结构不受支持。需要以下之一："
+        "1) external_code/retail + (embedding|emb|emb_*) + (curve|sales_wk_*)；"
+        "2) train_code/train_retail/train_curve/train_emb 或 test_*。"
+    )
 
 
 def _parse_topk_list(raw: str) -> list[int]:
@@ -259,12 +374,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--train_csv",
         default="train_item_embeddings.csv",
-        help="训练集 embedding CSV 路径",
+        help="训练集 embedding 文件路径（CSV/Parquet 均可）",
     )
     parser.add_argument(
         "--test_csv",
         default="test_item_embeddings.csv",
-        help="测试集 embedding CSV 路径",
+        help="测试集 embedding 文件路径（CSV/Parquet 均可）",
     )
     parser.add_argument("--top_k", type=int, default=20, help="每个测试样本选取的邻居数量")
     parser.add_argument(
@@ -283,10 +398,61 @@ if __name__ == "__main__":
         default="1,5,20",
         help="输出对比的 Top-K 列表，逗号分隔，例如: 1,5,20",
     )
+    parser.add_argument(
+        "--train_emb_npy",
+        default="",
+        help="可选: (N,D) 投影后的 train embedding，行序须与 train_csv 一致，将覆盖 CSV 中的 embedding 列",
+    )
+    parser.add_argument(
+        "--test_emb_npy",
+        default="",
+        help="可选: (M,D) 投影后的 test embedding，行序须与 test_csv 一致",
+    )
+    parser.add_argument(
+        "--train_nrows",
+        type=int,
+        default=None,
+        help="只读 train 文件前 n 行（默认全部）。快速测试示例: 5000",
+    )
+    parser.add_argument(
+        "--test_nrows",
+        type=int,
+        default=None,
+        help="只读 test 文件前 n 行（默认全部）。快速测试示例: 500",
+    )
+    parser.add_argument(
+        "--train_frac",
+        type=float,
+        default=1.0,
+        help="仅 train：与 export_item_embeddings --train_frac 一致；用已导出对齐表时请保持 1.0",
+    )
+    parser.add_argument(
+        "--train_sample_seed",
+        type=int,
+        default=21,
+        help="与 export_item_embeddings --seed 一致（train_frac<1 时）",
+    )
     args = parser.parse_args()
 
-    train_df = prepare_input_from_csv(args.train_csv)
-    test_df = prepare_input_from_csv(args.test_csv)
+    if not (0.0 < args.train_frac <= 1.0):
+        raise ValueError(f"--train_frac must be in (0, 1], got {args.train_frac}")
+
+    train_df = prepare_input_from_file(
+        args.train_csv,
+        nrows=args.train_nrows,
+        sample_frac=args.train_frac if args.train_frac < 1.0 else None,
+        sample_seed=args.train_sample_seed,
+    )
+    test_df = prepare_input_from_file(args.test_csv, nrows=args.test_nrows)
+    if args.train_nrows is not None or args.test_nrows is not None:
+        print(
+            f"Subset rows: train={len(train_df)} (train_nrows={args.train_nrows}), "
+            f"test={len(test_df)} (test_nrows={args.test_nrows})"
+        )
+    if args.train_emb_npy:
+        train_df = attach_embeddings_from_npy(train_df, args.train_emb_npy)
+    if args.test_emb_npy:
+        test_df = attach_embeddings_from_npy(test_df, args.test_emb_npy)
 
     final_ref_df, forecast_df, mae, wape = run_similarity_wape(
         test_df=test_df,

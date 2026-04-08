@@ -33,9 +33,10 @@ def run(args):
     pl.seed_everything(args.seed)
 
     # Load sales data
-    # load only 5000 and 500 for fast experiment
-    train_df = pd.read_csv(Path(args.data_folder + 'train.csv'), parse_dates=['release_date'], nrows=5000)
-    test_df = pd.read_csv(Path(args.data_folder + 'test.csv'), parse_dates=['release_date'], nrows=500)
+    train_df = pd.read_csv(Path(args.data_folder + 'train.csv'), parse_dates=['release_date'])
+    if args.train_frac < 1.0:
+        train_df = train_df.sample(frac=args.train_frac, random_state=args.seed).reset_index(drop=True)
+    test_df = pd.read_csv(Path(args.data_folder + 'test.csv'), parse_dates=['release_date'])
 
     # Load category and color encodings
     cat_dict = _torch_load_trusted(Path(args.data_folder + 'category_labels.pt'))
@@ -45,10 +46,11 @@ def run(args):
     # Load Google trends
     gtrends = pd.read_csv(Path(args.data_folder + 'gtrends.csv'), index_col=[0], parse_dates=True)
 
+    lazy = bool(args.lazy_loader)
     train_loader = ZeroShotDataset(train_df, Path(args.data_folder + '/images'), gtrends, cat_dict, col_dict,
-                                   fab_dict, args.trend_len).get_loader(batch_size=args.batch_size, train=True)
+                                   fab_dict, args.trend_len).get_loader(batch_size=args.batch_size, train=True, lazy=lazy)
     test_loader = ZeroShotDataset(test_df, Path(args.data_folder + '/images'), gtrends, cat_dict, col_dict,
-                                  fab_dict, args.trend_len).get_loader(batch_size=1, train=False)
+                                  fab_dict, args.trend_len).get_loader(batch_size=1, train=False, lazy=lazy)
 
     # Create model
     if args.model_type == 'FCN':
@@ -83,7 +85,8 @@ def run(args):
             num_trends=args.num_trends,
             use_encoder_mask=args.use_encoder_mask,
             autoregressive=args.autoregressive,
-            gpu_num=args.gpu_num
+            gpu_num=args.gpu_num,
+            use_hist_sales=args.use_hist_sales,
         )
 
     # Model Training
@@ -141,6 +144,12 @@ if __name__ == '__main__':
 
     # General arguments
     parser.add_argument('--data_folder', type=str, default='dataset/')
+    parser.add_argument(
+        '--lazy_loader',
+        type=int,
+        default=1,
+        help='1=惰性加载每条样本的 gtrends+图像（全量 train 省内存，与原版单样本数学一致）；0=原 preload 全表',
+    )
     parser.add_argument('--log_dir', type=str, default='log')
     parser.add_argument('--seed', type=int, default=21)
     parser.add_argument('--epochs', type=int, default=200)
@@ -151,8 +160,20 @@ if __name__ == '__main__':
     parser.add_argument('--use_trends', type=int, default=1)
     parser.add_argument('--use_img', type=int, default=1)
     parser.add_argument('--use_text', type=int, default=1)
+    parser.add_argument(
+        '--use_hist_sales',
+        type=int,
+        default=0,
+        help='1=将两周销量 recent_sales_2w 经 Sales2WeekEmbedder 接入 FusionNetwork（与 use_img/use_text 并列）',
+    )
     parser.add_argument('--trend_len', type=int, default=52)
     parser.add_argument('--num_trends', type=int, default=3)
+    parser.add_argument(
+        '--train_frac',
+        type=float,
+        default=1.0,
+        help='Random fraction of train.csv rows to use (0,1], e.g. 0.25 for 25%%. Uses args.seed for reproducibility.',
+    )
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--embedding_dim', type=int, default=32)
     parser.add_argument('--hidden_dim', type=int, default=64)
@@ -168,5 +189,6 @@ if __name__ == '__main__':
     parser.add_argument('--wandb_run', type=str, default='Run1')
 
     args = parser.parse_args()
+    if not (0.0 < args.train_frac <= 1.0):
+        raise ValueError(f"--train_frac must be in (0, 1], got {args.train_frac}")
     run(args)
-
