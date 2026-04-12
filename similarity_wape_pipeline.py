@@ -166,6 +166,56 @@ def calc_mae_wape(
     return round(mae, 3), round(wape, 3)
 
 
+def calc_cv_total(values: Iterable[float]) -> float:
+    """
+    计算 CV_total = mean(X) / std(X)。
+
+    若标准差为 0，则返回 nan，避免除零。
+    """
+    arr = np.asarray(list(values), dtype=float).ravel()
+    if arr.size == 0:
+        raise ValueError("CV_total 计算需要非空序列。")
+
+    mean_val = float(np.mean(arr))
+    std_val = float(np.std(arr))
+    if std_val < 1e-12:
+        return float("nan")
+    return mean_val / std_val
+
+
+def add_cv_total_column(df: pd.DataFrame, source_col: str, target_col: str = "CV_total") -> pd.DataFrame:
+    """为包含数值序列的列追加 CV_total 列。"""
+    if source_col not in df.columns:
+        raise ValueError(f"DataFrame 缺少列: {source_col}")
+
+    out = df.copy()
+    out[target_col] = out[source_col].apply(calc_cv_total)
+    return out
+
+
+def build_cv_total_summary(final_ref_df: pd.DataFrame, forecast_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    生成单行汇总表，统计整个 results 的 CV_total。
+
+    这里按“所有行、所有周”的方式展开后计算，分别汇总参考曲线、真实曲线和预测曲线。
+    """
+    required_final_ref = {"curve"}
+    required_forecast = {"true_curve", "pred_curve"}
+    miss_final_ref = required_final_ref - set(final_ref_df.columns)
+    miss_forecast = required_forecast - set(forecast_df.columns)
+    if miss_final_ref:
+        raise ValueError(f"final_ref_df 缺少列: {sorted(miss_final_ref)}")
+    if miss_forecast:
+        raise ValueError(f"forecast_df 缺少列: {sorted(miss_forecast)}")
+
+    summary_row = {
+        "final_ref_CV_total": calc_cv_total(final_ref_df["curve"]),
+        "forecast_true_CV_total": calc_cv_total(forecast_df["true_curve"]),
+        "forecast_pred_CV_total": calc_cv_total(forecast_df["pred_curve"]),
+    }
+    return pd.DataFrame([summary_row])
+
+
 def run_similarity_wape(
     test_df: pd.DataFrame,
     train_df: pd.DataFrame,
@@ -485,7 +535,13 @@ if __name__ == "__main__":
     if args.save_prefix:
         ref_path = f"{args.save_prefix}_final_ref.csv"
         forecast_path = f"{args.save_prefix}_forecast.csv"
-        final_ref_df.to_csv(ref_path, index=False)
-        forecast_df.to_csv(forecast_path, index=False)
+        summary_path = f"{args.save_prefix}_summary.csv"
+        final_ref_with_cv = add_cv_total_column(final_ref_df, source_col="curve", target_col="CV_total")
+        forecast_with_cv = add_cv_total_column(forecast_df, source_col="pred_curve", target_col="CV_total")
+        summary_df = build_cv_total_summary(final_ref_df, forecast_df)
+        final_ref_with_cv.to_csv(ref_path, index=False)
+        forecast_with_cv.to_csv(forecast_path, index=False)
+        summary_df.to_csv(summary_path, index=False)
         print(f"Saved: {ref_path}")
         print(f"Saved: {forecast_path}")
+        print(f"Saved: {summary_path}")

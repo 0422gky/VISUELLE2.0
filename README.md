@@ -106,7 +106,7 @@ python export_item_embeddings.py --checkpoint "path/to/your.ckpt" --data_folder 
 ```
 
 ```bash
-# example of ckpt path
+# example of ckpt path and export item embeddings
 tmp_GTM_transformer/log/GTM/GTM_Run1---epoch=29---25-03-2026-13-17-24.ckpt
 
 python export_item_embeddings.py --checkpoint "log/GTM/GTM_Run1---epoch=29---25-03-2026-13-17-24.ckpt" --data_folder "visuelle2/" --split all --output_dir "outputs/"
