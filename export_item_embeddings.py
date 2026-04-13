@@ -254,6 +254,7 @@ def export_for_df(
     offset = 0
     model.eval()
     first_print_done = False
+    ablate_print_done = False
 
     for batch in loader:
         # TensorDataset item order:
@@ -269,6 +270,12 @@ def export_for_df(
         temporal_features = temporal_features.to(args.device)
         gtrends = gtrends.to(args.device)
         images = images.to(args.device)
+
+        if args.ablate_trends:
+            if not ablate_print_done:
+                print(f"[{split_name}] ablate_trends=1: set gtrends tensor to zeros before forward")
+                ablate_print_done = True
+            gtrends = torch.zeros_like(gtrends)
 
         pred, fused_feature = model(
             category,
@@ -417,6 +424,12 @@ def main():
         default="parquet",
         choices=["parquet", "csv"],
         help="紧凑表落盘格式：parquet（默认，保留 list 列类型，需 pyarrow）；csv 为文本表",
+    )
+    parser.add_argument(
+        "--ablate_trends",
+        type=int,
+        default=0,
+        help="1=快速近似消融：导出 embedding 时将每个 batch 的 gtrends 置零后再前向；0=正常输入",
     )
 
     args = parser.parse_args()

@@ -132,11 +132,11 @@ python train_curve_projector.py --train_embeddings_npy outputs/train_item_embedd
 # 2) 生成投影后的 train/test npy
 python apply_curve_projector.py --projector_dir results/curve_projector --train_embeddings_npy outputs/train_item_embeddings.npy  --test_embeddings_npy outputs/test_item_embeddings.npy --output_dir results/curve_projector/projected
 
-# 3) WAPE（ GTM-Transformer 下用 run_similarity_wape_with_projected.py） 这个是使用了对比学习的metric
+# 3) WAPE（ GTM-Transformer 下用 run_similarity_wape_with_projected.py） 这个是使用了对比学习的metric 有对比学习，没有PCA
 python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.parquet --test_csv outputs/test_item_embeddings.parquet   --train_emb_npy results/curve_projector/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector/WAPE_results
 
 
-# 不使用对比学习trick跑的 WAPE
+# 不使用对比学习trick跑的 WAPE 没有对比学习/PCA
 python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.parquet --test_csv outputs/test_item_embeddings.parquet   --train_emb_npy outputs/train_item_embeddings.npy   --test_emb_npy outputs/test_item_embeddings.npy --save_prefix results/curve_nonprojected/WAPE_results
 ```
 
@@ -159,6 +159,43 @@ python apply_curve_projector.py \
   --output_dir results/curve_projector_pca/projected \
   --device cuda
 
+# 对比学习+PCA
 python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.parquet --test_csv outputs/test_item_embeddings.parquet   --train_emb_npy results/curve_projector_pca/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector_pca/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector_pca/WAPE_results
 
+```
+
+## sim wape pipeline
+
+这里才能看Avg_pairwise_corr等四个参数
+'Avg_pairwise_corr': 
+'Avg_cv_total': 
+'Avg_cv_week'
+'Avg_sim': 
+
+
+## 0销量数据 zero-shot cold start
+```bash
+# 使用outputs_44_frac4下的数据(仅为远端linux示例)，实际复现时请自己训练不带有2 weeks 销量作为embedding的数据
+
+python similarity_wape_pipeline.py  --train_csv outputs_44_frac4/train_item_embeddings.parquet  --test_csv outputs_44_frac4/test_item_embeddings.parquet  --top_k 20  --start_week 2  --save_prefix results/sim_wape  --compare_topk 1,5,20
+```
+
+## ablation study
+1. 不使用Google trends数据（只是在导出emebddings时置为0，并不是前面训练GTM不用，只是为了工程方便）
+
+```bash
+python export_item_embeddings.py --checkpoint "log/GTM/GTM_Run1---epoch=104---02-04-2026-21-00-31.ckpt"   --data_folder "visuelle2/"   --output_dir outputs_ablate_trends --split all --ablate_trends 1
+```
+
+
+
+消融projector
+```bash
+python train_curve_projector.py --train_embeddings_npy outputs_ablate_trends/train_item_embeddings.npy  --train_curves_csv outputs_ablate_trends/train_item_embeddings.parquet  --output_dir results/curve_projector_ablate_trends --epochs 20
+
+python apply_curve_projector.py --projector_dir results/curve_projector_ablate_trends  --train_embeddings_npy outputs_ablate_trends/train_item_embeddings.npy  --test_embeddings_npy outputs_ablate_trends/test_item_embeddings.npy  --output_dir results/curve_projector_ablate_trends/projected
+
+最后 similarity_wape_pipeline
+
+python similarity_wape_pipeline.py --train_csv outputs_ablate_trends/train_item_embeddings.parquet --test_csv outputs_ablate_trends/test_item_embeddings.parquet   --train_emb_npy results/curve_projector_ablate_trends/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector_ablate_trends/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector_ablate_trends/WAPE_results
 ```

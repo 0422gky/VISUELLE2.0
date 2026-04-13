@@ -24,6 +24,14 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 
+from utils.curve_eval_metrics import avg_pearson_avg_dtw
+from utils.ref_group_curve_stats import (
+    ref_group_flat_means_from_summary,
+    ref_group_stats_from_final_ref_df,
+    save_ref_group_artifacts,
+    summary_stats_to_jsonable,
+)
+
 
 def _to_2d_array(series: pd.Series, name: str) -> np.ndarray:
     """将 DataFrame 某列(list/ndarray)安全堆叠为二维矩阵。"""
@@ -166,54 +174,24 @@ def calc_mae_wape(
     return round(mae, 3), round(wape, 3)
 
 
-def calc_cv_total(values: Iterable[float]) -> float:
+def curve_shape_metrics_from_forecast_df(
+    forecast_df: pd.DataFrame,
+    start_week: int = 2,
+) -> tuple[float, float]:
     """
-    计算 CV_total = mean(X) / std(X)。
-
-    若标准差为 0，则返回 nan，避免除零。
+    与 calc_mae_wape 相同时间窗：从第 start_week 周（1-based）起至序列末尾，
+    对 true_curve vs pred_curve 计算 Avg_Pearson、Avg_DTW。
     """
-    arr = np.asarray(list(values), dtype=float).ravel()
-    if arr.size == 0:
-        raise ValueError("CV_total 计算需要非空序列。")
-
-    mean_val = float(np.mean(arr))
-    std_val = float(np.std(arr))
-    if std_val < 1e-12:
-        return float("nan")
-    return mean_val / std_val
-
-
-def add_cv_total_column(df: pd.DataFrame, source_col: str, target_col: str = "CV_total") -> pd.DataFrame:
-    """为包含数值序列的列追加 CV_total 列。"""
-    if source_col not in df.columns:
-        raise ValueError(f"DataFrame 缺少列: {source_col}")
-
-    out = df.copy()
-    out[target_col] = out[source_col].apply(calc_cv_total)
-    return out
-
-
-def build_cv_total_summary(final_ref_df: pd.DataFrame, forecast_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    生成单行汇总表，统计整个 results 的 CV_total。
-
-    这里按“所有行、所有周”的方式展开后计算，分别汇总参考曲线、真实曲线和预测曲线。
-    """
-    required_final_ref = {"curve"}
-    required_forecast = {"true_curve", "pred_curve"}
-    miss_final_ref = required_final_ref - set(final_ref_df.columns)
-    miss_forecast = required_forecast - set(forecast_df.columns)
-    if miss_final_ref:
-        raise ValueError(f"final_ref_df 缺少列: {sorted(miss_final_ref)}")
-    if miss_forecast:
-        raise ValueError(f"forecast_df 缺少列: {sorted(miss_forecast)}")
-
-    summary_row = {
-        "final_ref_CV_total": calc_cv_total(final_ref_df["curve"]),
-        "forecast_true_CV_total": calc_cv_total(forecast_df["true_curve"]),
-        "forecast_pred_CV_total": calc_cv_total(forecast_df["pred_curve"]),
-    }
-    return pd.DataFrame([summary_row])
+    if forecast_df.empty:
+        return 0.0, 0.0
+    gt = np.stack([np.asarray(x, dtype=np.float64) for x in forecast_df["true_curve"]])
+    pred = np.stack([np.asarray(x, dtype=np.float64) for x in forecast_df["pred_curve"]])
+    if gt.shape != pred.shape or gt.ndim != 2:
+        raise ValueError(f"forecast_df 曲线 shape 异常: gt {gt.shape}, pred {pred.shape}")
+    start_idx = start_week - 1
+    if start_week < 1 or start_idx >= gt.shape[1]:
+        raise ValueError(f"start_week 超范围: {start_week}, 周数={gt.shape[1]}")
+    return avg_pearson_avg_dtw(gt, pred, wsl=start_idx, tw=None)
 
 
 def run_similarity_wape(
@@ -223,12 +201,24 @@ def run_similarity_wape(
     start_week: int = 2,
     embedding_col: str = "embedding",
     curve_col: str = "curve",
-) -> tuple[pd.DataFrame, pd.DataFrame, float, float]:
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    float,
+    float,
+    float,
+    float,
+    pd.DataFrame | None,
+    pd.DataFrame | None,
+]:
     """
     一站式执行:
     - final_ref_df: 邻居明细
     - forecast_df: 预测结果
     - mae, wape: 指标
+    - avg_pearson, avg_dtw: 与 mae/wape 同一时间窗的曲线形状指标
+    - ref_group_per_sku_df, ref_group_summary_stats: 按每个 test 样本聚合的邻居参考曲线组统计
+      （与 exploration test_codes_df 语义一致）；无 final_ref 时为 (None, None)
     """
     final_ref_df = build_similarity_refs(
         test_df=test_df,
@@ -243,7 +233,25 @@ def run_similarity_wape(
         pred_list=forecast_df["pred_curve"],
         start_week=start_week,
     )
-    return final_ref_df, forecast_df, mae, wape
+    avg_pearson, avg_dtw = curve_shape_metrics_from_forecast_df(forecast_df, start_week=start_week)
+
+    wsl = start_week - 1
+    rg = ref_group_stats_from_final_ref_df(final_ref_df, wsl=wsl, tw=None)
+    if rg is None:
+        ref_group_per_sku_df, ref_group_summary_stats = None, None
+    else:
+        ref_group_per_sku_df, ref_group_summary_stats = rg
+
+    return (
+        final_ref_df,
+        forecast_df,
+        mae,
+        wape,
+        avg_pearson,
+        avg_dtw,
+        ref_group_per_sku_df,
+        ref_group_summary_stats,
+    )
 
 
 def _parse_embedding_cell(value) -> np.ndarray:
@@ -504,7 +512,16 @@ if __name__ == "__main__":
     if args.test_emb_npy:
         test_df = attach_embeddings_from_npy(test_df, args.test_emb_npy)
 
-    final_ref_df, forecast_df, mae, wape = run_similarity_wape(
+    (
+        final_ref_df,
+        forecast_df,
+        mae,
+        wape,
+        avg_pearson,
+        avg_dtw,
+        ref_group_per_sku_df,
+        ref_group_summary_stats,
+    ) = run_similarity_wape(
         test_df=test_df,
         train_df=train_df,
         top_k=args.top_k,
@@ -516,12 +533,20 @@ if __name__ == "__main__":
     print(f"Top-K: {args.top_k}")
     print(f"Global MAE (W{args.start_week}-W12): {mae}")
     print(f"Global WAPE (W{args.start_week}-W12): {wape}%")
+    print(f"Avg_Pearson (W{args.start_week}-W12): {avg_pearson:.4f}")
+    print(f"Avg_DTW (W{args.start_week}-W12): {avg_dtw:.4f}")
+
+    if ref_group_summary_stats is not None:
+        print("\n=== Neighbor ref-curve group stats (per test_code×test_retail, W{}+) ===".format(args.start_week))
+        print(ref_group_summary_stats.to_string())
+        flat = ref_group_flat_means_from_summary(summary_stats_to_jsonable(ref_group_summary_stats))
+        print(f"flat_means: {flat}")
 
     compare_topk_list = _parse_topk_list(args.compare_topk)
     if compare_topk_list:
         print("\n=== WAPE Compare ===")
         for k in compare_topk_list:
-            _, fc_k, mae_k, wape_k = run_similarity_wape(
+            _, fc_k, mae_k, wape_k, ap_k, dtw_k, _, _ = run_similarity_wape(
                 test_df=test_df,
                 train_df=train_df,
                 top_k=k,
@@ -529,19 +554,16 @@ if __name__ == "__main__":
             )
             print(
                 f"Top{k:<2} -> Samples: {len(fc_k):>3}, "
-                f"MAE: {mae_k:.3f}, WAPE: {wape_k:.3f}%"
+                f"MAE: {mae_k:.3f}, WAPE: {wape_k:.3f}%, "
+                f"Avg_P: {ap_k:.4f}, Avg_DTW: {dtw_k:.4f}"
             )
 
     if args.save_prefix:
         ref_path = f"{args.save_prefix}_final_ref.csv"
         forecast_path = f"{args.save_prefix}_forecast.csv"
-        summary_path = f"{args.save_prefix}_summary.csv"
-        final_ref_with_cv = add_cv_total_column(final_ref_df, source_col="curve", target_col="CV_total")
-        forecast_with_cv = add_cv_total_column(forecast_df, source_col="pred_curve", target_col="CV_total")
-        summary_df = build_cv_total_summary(final_ref_df, forecast_df)
-        final_ref_with_cv.to_csv(ref_path, index=False)
-        forecast_with_cv.to_csv(forecast_path, index=False)
-        summary_df.to_csv(summary_path, index=False)
+        final_ref_df.to_csv(ref_path, index=False)
+        forecast_df.to_csv(forecast_path, index=False)
         print(f"Saved: {ref_path}")
         print(f"Saved: {forecast_path}")
-        print(f"Saved: {summary_path}")
+        if ref_group_per_sku_df is not None and ref_group_summary_stats is not None:
+            save_ref_group_artifacts(args.save_prefix, ref_group_per_sku_df, ref_group_summary_stats)

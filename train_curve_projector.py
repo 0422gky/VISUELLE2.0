@@ -29,6 +29,13 @@ from modules.curve_metric_projector import (
     pearson_r_batch,
     transform_with_pca,
 )
+from utils.curve_eval_metrics import avg_pearson_avg_dtw
+from utils.ref_group_curve_stats import (
+    ref_group_flat_means_from_summary,
+    ref_group_stats_from_train_export_table,
+    summary_stats_to_jsonable,
+    train_export_ref_group_skip_reason,
+)
 
 
 def _read_tabular(path: str, nrows: int | None = None) -> pd.DataFrame:
@@ -89,16 +96,14 @@ def load_curves_12w(csv_path: str, nrows: int | None = None) -> np.ndarray:
     return _curves_array_from_df(df)
 
 
-def load_train_curves_for_projector(
+def load_train_df_for_projector(
     csv_path: str,
     train_frac: float,
     train_sample_seed: int,
     max_train_rows: int | None,
-) -> np.ndarray:
+) -> pd.DataFrame:
     """
-    与 export_item_embeddings 对齐：
-    - train_frac<1 时先全表读入再 sample（需与导出 npy 使用相同 frac/seed）；
-    - train_frac==1 且 max_train_rows 时可用 nrows 只读前 N 行（省内存）。
+    与 export_item_embeddings 对齐，返回与 npy 行对齐的 DataFrame（再由此取 curves）。
     """
     if train_frac < 1.0:
         df = _read_tabular(csv_path, nrows=None)
@@ -107,6 +112,17 @@ def load_train_curves_for_projector(
             df = df.iloc[: int(max_train_rows)].reset_index(drop=True)
     else:
         df = _read_tabular(csv_path, nrows=max_train_rows)
+    return df.reset_index(drop=True)
+
+
+def load_train_curves_for_projector(
+    csv_path: str,
+    train_frac: float,
+    train_sample_seed: int,
+    max_train_rows: int | None,
+) -> np.ndarray:
+    """见 load_train_df_for_projector；仅返回 (N, 12) 曲线矩阵。"""
+    df = load_train_df_for_projector(csv_path, train_frac, train_sample_seed, max_train_rows)
     return _curves_array_from_df(df)
 
 
@@ -173,6 +189,42 @@ def train_loop(
     return losses
 
 
+@torch.no_grad()
+def encode_all_embeddings(
+    model: CurveMetricProjector,
+    X: np.ndarray,
+    device: torch.device,
+    batch_size: int,
+) -> np.ndarray:
+    """将训练集输入矩阵投影为 L2 归一化后的 (N, out_dim)。"""
+    model.eval()
+    x_np = np.asarray(X, dtype=np.float32)
+    chunks: list[np.ndarray] = []
+    for i0 in range(0, x_np.shape[0], batch_size):
+        chunk = torch.from_numpy(x_np[i0 : i0 + batch_size]).to(device)
+        chunks.append(model(chunk).float().cpu().numpy())
+    return np.concatenate(chunks, axis=0).astype(np.float32)
+
+
+def nn_indices_max_cosine(Z: np.ndarray, batch_rows: int) -> np.ndarray:
+    """
+    Z: (N, D) 已为 L2 归一化。返回每个 i 在 j!=i 上余弦相似度最大的 j。
+    用于「用 embedding 最近邻的 train 曲线」近似检索质量，与 Avg_Pearson / Avg_DTW 配套。
+    """
+    z = np.asarray(Z, dtype=np.float32)
+    z = z / (np.linalg.norm(z, axis=1, keepdims=True) + 1e-8)
+    n = z.shape[0]
+    nn_idx = np.empty(n, dtype=np.int64)
+    zt = z.T
+    for i0 in range(0, n, batch_rows):
+        i1 = min(n, i0 + batch_rows)
+        sim = z[i0:i1] @ zt
+        loc = np.arange(i0, i1)
+        sim[np.arange(loc.size), loc] = -np.inf
+        nn_idx[i0:i1] = np.argmax(sim, axis=1).astype(np.int64)
+    return nn_idx
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train curve-aligned metric projector")
     parser.add_argument(
@@ -220,18 +272,65 @@ def main():
         default=21,
         help="与 export_item_embeddings --seed 一致（train_frac<1 时的 random_state）",
     )
+    parser.add_argument(
+        "--eval_wsl",
+        type=int,
+        default=2,
+        help="训练结束后 1-NN 曲线评估：窗口起点索引（含），与 curve_eval_metrics 一致",
+    )
+    parser.add_argument(
+        "--eval_tw",
+        type=int,
+        default=None,
+        help="窗口终点索引（不含）；默认 None 表示用满 12 周",
+    )
+    parser.add_argument(
+        "--no_nn_curve_metrics",
+        action="store_true",
+        help="关闭训练集上的 embedding 1-NN 邻居曲线 vs 自身的 Avg_Pearson / Avg_DTW",
+    )
+    parser.add_argument("--encode_batch_size", type=int, default=4096, help="全量投影时的 batch 大小")
+    parser.add_argument(
+        "--nn_sim_batch_rows",
+        type=int,
+        default=512,
+        help="计算逐样本余弦最近邻时的行块大小（控制峰值内存）",
+    )
+    parser.add_argument(
+        "--train_export_ref_group_metrics",
+        action="store_true",
+        help="极少用：在「一行一 SKU」的 train 导出表上算组统计（多数量弱）。"
+        "与 exploration 一致的 Avg_sim/Avg_corr/CV 应对 similarity 的 final_ref 算，见 similarity_wape_pipeline --save_prefix。",
+    )
     args = parser.parse_args()
 
     if not (0.0 < args.train_frac <= 1.0):
         raise ValueError(f"--train_frac must be in (0, 1], got {args.train_frac}")
 
     emb = np.load(args.train_embeddings_npy)
-    curves = load_train_curves_for_projector(
+    train_df = load_train_df_for_projector(
         args.train_curves_csv,
         train_frac=args.train_frac,
         train_sample_seed=args.train_sample_seed,
         max_train_rows=args.max_train_rows,
     )
+    curves = _curves_array_from_df(train_df)
+
+    ref_group_stats_json: dict[str, dict[str, float | None]] | None = None
+    ref_group_n_groups: int | None = None
+    if args.train_export_ref_group_metrics:
+        rg = ref_group_stats_from_train_export_table(
+            train_df, wsl=int(args.eval_wsl), tw=args.eval_tw
+        )
+        if rg is not None:
+            rg_df, rg_summary = rg
+            ref_group_stats_json = summary_stats_to_jsonable(rg_summary)
+            ref_group_n_groups = int(len(rg_df))
+            print("[ref_group/train_export] 汇总（写入 config.json）")
+            print(rg_summary.to_string())
+        else:
+            msg = train_export_ref_group_skip_reason(train_df)
+            print(f"[ref_group/train_export] 跳过: {msg or '未知原因'}")
     if args.train_frac < 1.0 or args.max_train_rows is not None:
         print(
             f"Curves rows={curves.shape[0]} (train_frac={args.train_frac}, "
@@ -275,6 +374,24 @@ def main():
         seed=args.seed,
     )
 
+    nn_avg_pearson: float | None = None
+    nn_avg_dtw: float | None = None
+    if not args.no_nn_curve_metrics:
+        Z = encode_all_embeddings(
+            model, X, device, batch_size=int(args.encode_batch_size)
+        )
+        nn_j = nn_indices_max_cosine(Z, batch_rows=int(args.nn_sim_batch_rows))
+        pred_c = curves[nn_j].astype(np.float64, copy=False)
+        gt_c = curves.astype(np.float64, copy=False)
+        nn_avg_pearson, nn_avg_dtw = avg_pearson_avg_dtw(
+            gt_c, pred_c, wsl=int(args.eval_wsl), tw=args.eval_tw
+        )
+        tw_disp = args.eval_tw if args.eval_tw is not None else curves.shape[1]
+        print(
+            f"[train 1-NN curve vs self] Avg_Pearson={nn_avg_pearson:.4f}  "
+            f"Avg_DTW={nn_avg_dtw:.4f}  (window [{args.eval_wsl}:{tw_disp}), N={curves.shape[0]})"
+        )
+
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -282,7 +399,12 @@ def main():
     if pca is not None:
         joblib.dump(pca, out_dir / "pca_model.joblib")
 
-    config = {
+    flat_ref_means = (
+        ref_group_flat_means_from_summary(ref_group_stats_json)
+        if ref_group_stats_json
+        else {}
+    )
+    config: dict = {
         "raw_embedding_dim": raw_dim,
         "input_dim": input_dim,
         "hidden_dim": args.hidden_dim,
@@ -292,7 +414,23 @@ def main():
         "train_frac": float(args.train_frac),
         "train_sample_seed": int(args.train_sample_seed),
         "max_train_rows": args.max_train_rows,
+        "nn_curve_eval_wsl": int(args.eval_wsl),
+        "nn_curve_eval_tw": args.eval_tw,
+        "nn_curve_avg_pearson": nn_avg_pearson,
+        "nn_curve_avg_dtw": nn_avg_dtw,
+        "neighbor_ref_group_metrics": (
+            "在 similarity_wape_pipeline 对 test 检索 train 后，由 final_ref_df 计算；"
+            "运行: python similarity_wape_pipeline.py ... --save_prefix <前缀>，"
+            "将生成 <前缀>_ref_group_summary.json 与 <前缀>_ref_group_per_sku.csv"
+        ),
     }
+    if ref_group_stats_json is not None:
+        config["ref_group_on_train_export"] = True
+        config["ref_group_stats_wsl"] = int(args.eval_wsl)
+        config["ref_group_stats_tw"] = args.eval_tw
+        config["ref_group_n_groups"] = ref_group_n_groups
+        config.update(flat_ref_means)
+        config["ref_group_stats"] = ref_group_stats_json
     with open(out_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
