@@ -199,3 +199,32 @@ python apply_curve_projector.py --projector_dir results/curve_projector_ablate_t
 
 python similarity_wape_pipeline.py --train_csv outputs_ablate_trends/train_item_embeddings.parquet --test_csv outputs_ablate_trends/test_item_embeddings.parquet   --train_emb_npy results/curve_projector_ablate_trends/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector_ablate_trends/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector_ablate_trends/WAPE_results
 ```
+
+## ablation study 2: fabric + color + category + images
+```bash
+python export_item_embeddings.py \
+  --checkpoint <CKPT_PATH> \
+  --data_folder <DATA_FOLDER> \
+  --output_dir outputs_ablation2 \
+  --split all \
+  --ablation2_ccf_img 1
+
+python train_curve_projector.py \
+  --train_embeddings_npy outputs_ablation2/train_item_embeddings.npy \
+  --train_curves_csv outputs_ablation2/train_item_embeddings.parquet \
+  --output_dir results/curve_projector_ablation2 \
+  --epochs 20
+
+python apply_curve_projector.py \
+  --projector_dir results/curve_projector_ablation2 \
+  --train_embeddings_npy outputs_ablation2/train_item_embeddings.npy \
+  --test_embeddings_npy outputs_ablation2/test_item_embeddings.npy \
+  --output_dir results/curve_projector_ablation2/projected
+
+python similarity_wape_pipeline.py \
+  --train_csv outputs_ablation2/train_item_embeddings.parquet \
+  --test_csv outputs_ablation2/test_item_embeddings.parquet \
+  --train_emb_npy results/curve_projector_ablation2/projected/train_item_embeddings_projected.npy \
+  --test_emb_npy results/curve_projector_ablation2/projected/test_item_embeddings_projected.npy \
+  --save_prefix results/curve_projector_ablation2/eval
+```

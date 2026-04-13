@@ -255,6 +255,7 @@ def export_for_df(
     model.eval()
     first_print_done = False
     ablate_print_done = False
+    ablate2_print_done = False
 
     for batch in loader:
         # TensorDataset item order:
@@ -271,7 +272,17 @@ def export_for_df(
         gtrends = gtrends.to(args.device)
         images = images.to(args.device)
 
-        if args.ablate_trends:
+        if args.ablation2_ccf_img:
+            if not ablate2_print_done:
+                print(
+                    f"[{split_name}] ablation2_ccf_img=1: keep only category/color/fabric + image signal; "
+                    "set gtrends/temporal_features/recent_sales_2w to zeros before forward"
+                )
+                ablate2_print_done = True
+            gtrends = torch.zeros_like(gtrends)
+            temporal_features = torch.zeros_like(temporal_features)
+            recent_sales_2w = torch.zeros_like(recent_sales_2w)
+        elif args.ablate_trends:
             if not ablate_print_done:
                 print(f"[{split_name}] ablate_trends=1: set gtrends tensor to zeros before forward")
                 ablate_print_done = True
@@ -430,6 +441,13 @@ def main():
         type=int,
         default=0,
         help="1=快速近似消融：导出 embedding 时将每个 batch 的 gtrends 置零后再前向；0=正常输入",
+    )
+    parser.add_argument(
+        "--ablation2_ccf_img",
+        type=int,
+        default=0,
+        help="1=快速近似消融2：仅保留 category/color/fabric + image 信号；"
+        "导出 embedding 时将 gtrends/temporal_features/recent_sales_2w 置零；0=关闭",
     )
 
     args = parser.parse_args()
