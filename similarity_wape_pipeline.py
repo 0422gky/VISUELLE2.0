@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 
+from utils.common_utils import sample_train_df
 from utils.curve_eval_metrics import avg_pearson_avg_dtw
 from utils.ref_group_curve_stats import (
     ref_group_flat_means_from_summary,
@@ -31,6 +32,16 @@ from utils.ref_group_curve_stats import (
     save_ref_group_artifacts,
     summary_stats_to_jsonable,
 )
+
+REF_COLUMNS = [
+    "external_code",
+    "retail",
+    "curve",
+    "sim_score",
+    "test_code",
+    "test_retail",
+    "test_curve",
+]
 
 
 def _to_2d_array(series: pd.Series, name: str) -> np.ndarray:
@@ -84,17 +95,7 @@ def build_similarity_refs(
         results.append(refs)
 
     if not results:
-        return pd.DataFrame(
-            columns=[
-                "external_code",
-                "retail",
-                "curve",
-                "sim_score",
-                "test_code",
-                "test_retail",
-                "test_curve",
-            ]
-        )
+        return pd.DataFrame(columns=REF_COLUMNS)
 
     final_ref_df = pd.concat(results, ignore_index=True)
     return final_ref_df
@@ -254,15 +255,15 @@ def run_similarity_wape(
     )
 
 
-def _parse_embedding_cell(value) -> np.ndarray:
-    """将 embedding 单元格解析为 np.ndarray。"""
+def _parse_numeric_array_cell(value, field_name: str) -> np.ndarray:
+    """将单元格(list/ndarray/字符串数组)解析为 float ndarray。"""
     if isinstance(value, np.ndarray):
         return value.astype(float)
     if isinstance(value, list):
         return np.asarray(value, dtype=float)
     if isinstance(value, str):
         return np.asarray(ast.literal_eval(value), dtype=float)
-    raise ValueError(f"无法解析 embedding 值类型: {type(value)}")
+    raise ValueError(f"无法解析 `{field_name}` 值类型: {type(value)}")
 
 
 def attach_embeddings_from_npy(df: pd.DataFrame, emb_npy: str | np.ndarray) -> pd.DataFrame:
@@ -282,26 +283,6 @@ def attach_embeddings_from_npy(df: pd.DataFrame, emb_npy: str | np.ndarray) -> p
     out = df.copy()
     out["embedding"] = [emb[i].astype(np.float64, copy=False) for i in range(n_df)]
     return out
-
-
-def _parse_curve_cell(value) -> np.ndarray:
-    """将 curve 单元格解析为 np.ndarray。"""
-    if isinstance(value, np.ndarray):
-        return value.astype(float)
-    if isinstance(value, list):
-        return np.asarray(value, dtype=float)
-    if isinstance(value, str):
-        return np.asarray(ast.literal_eval(value), dtype=float)
-    raise ValueError(f"无法解析 curve 值类型: {type(value)}")
-
-
-def sample_train_df(df: pd.DataFrame, train_frac: float, seed: int) -> pd.DataFrame:
-    """与 export_item_embeddings / train.py 一致：仅对 train 子集抽样。"""
-    if not (0.0 < train_frac <= 1.0):
-        raise ValueError(f"train_frac must be in (0, 1], got {train_frac}")
-    if train_frac < 1.0:
-        return df.sample(frac=train_frac, random_state=seed).reset_index(drop=True)
-    return df.reset_index(drop=True)
 
 
 def _read_table(path: str, nrows: int | None = None) -> pd.DataFrame:
@@ -387,8 +368,8 @@ def prepare_input_from_file(
             out["curve"] = out[week_cols].astype(float).values.tolist()
             curve_col = "curve"
 
-        out["embedding"] = out[emb_col].apply(_parse_embedding_cell)
-        out["curve"] = out[curve_col].apply(_parse_curve_cell)
+        out["embedding"] = out[emb_col].apply(lambda x: _parse_numeric_array_cell(x, "embedding"))
+        out["curve"] = out[curve_col].apply(lambda x: _parse_numeric_array_cell(x, "curve"))
         out = out[[code_col, retail_col, "embedding", "curve"]].copy()
         out.rename(columns={code_col: "external_code", retail_col: "retail"}, inplace=True)
         return out
@@ -397,8 +378,8 @@ def prepare_input_from_file(
     picked = _pick_prefixed_cols(out)
     if picked is not None:
         code_col, retail_col, curve_col, emb_col = picked
-        out["embedding"] = out[emb_col].apply(_parse_embedding_cell)
-        out["curve"] = out[curve_col].apply(_parse_curve_cell)
+        out["embedding"] = out[emb_col].apply(lambda x: _parse_numeric_array_cell(x, "embedding"))
+        out["curve"] = out[curve_col].apply(lambda x: _parse_numeric_array_cell(x, "curve"))
         out = out[[code_col, retail_col, "embedding", "curve"]].copy()
         out.rename(columns={code_col: "external_code", retail_col: "retail"}, inplace=True)
         return out
@@ -427,7 +408,7 @@ def _parse_topk_list(raw: str) -> list[int]:
     return sorted(set(values))
 
 
-if __name__ == "__main__":
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="相似度检索并计算 WAPE")
     parser.add_argument(
         "--train_csv",
@@ -490,6 +471,75 @@ if __name__ == "__main__":
         default=21,
         help="与 export_item_embeddings --seed 一致（train_frac<1 时）",
     )
+    return parser
+
+
+def _print_main_metrics(
+    forecast_df: pd.DataFrame,
+    *,
+    top_k: int,
+    start_week: int,
+    mae: float,
+    wape: float,
+    avg_pearson: float,
+    avg_dtw: float,
+) -> None:
+    print("=== Similarity Forecast Metrics ===")
+    print(f"Samples: {len(forecast_df)}")
+    print(f"Top-K: {top_k}")
+    print(f"Global MAE (W{start_week}-W12): {mae}")
+    print(f"Global WAPE (W{start_week}-W12): {wape}%")
+    print(f"Avg_Pearson (W{start_week}-W12): {avg_pearson:.4f}")
+    print(f"Avg_DTW (W{start_week}-W12): {avg_dtw:.4f}")
+
+
+def _print_compare_topk(
+    *,
+    compare_topk_list: list[int],
+    test_df: pd.DataFrame,
+    train_df: pd.DataFrame,
+    start_week: int,
+) -> None:
+    if not compare_topk_list:
+        return
+
+    print("\n=== WAPE Compare ===")
+    for k in compare_topk_list:
+        _, fc_k, mae_k, wape_k, ap_k, dtw_k, _, _ = run_similarity_wape(
+            test_df=test_df,
+            train_df=train_df,
+            top_k=k,
+            start_week=start_week,
+        )
+        print(
+            f"Top{k:<2} -> Samples: {len(fc_k):>3}, "
+            f"MAE: {mae_k:.3f}, WAPE: {wape_k:.3f}%, "
+            f"Avg_P: {ap_k:.4f}, Avg_DTW: {dtw_k:.4f}"
+        )
+
+
+def _save_outputs(
+    *,
+    save_prefix: str,
+    final_ref_df: pd.DataFrame,
+    forecast_df: pd.DataFrame,
+    ref_group_per_sku_df: pd.DataFrame | None,
+    ref_group_summary_stats: pd.DataFrame | None,
+) -> None:
+    if not save_prefix:
+        return
+    ref_path = f"{save_prefix}_final_ref.csv"
+    forecast_path = f"{save_prefix}_forecast.csv"
+    final_ref_df.to_csv(ref_path, index=False)
+    forecast_df.to_csv(forecast_path, index=False)
+    print(f"Saved: {ref_path}")
+    print(f"Saved: {forecast_path}")
+    if ref_group_per_sku_df is not None and ref_group_summary_stats is not None:
+        save_ref_group_artifacts(save_prefix, ref_group_per_sku_df, ref_group_summary_stats)
+
+
+def main() -> None:
+    parser = _build_parser()
     args = parser.parse_args()
 
     if not (0.0 < args.train_frac <= 1.0):
@@ -528,13 +578,15 @@ if __name__ == "__main__":
         start_week=args.start_week,
     )
 
-    print("=== Similarity Forecast Metrics ===")
-    print(f"Samples: {len(forecast_df)}")
-    print(f"Top-K: {args.top_k}")
-    print(f"Global MAE (W{args.start_week}-W12): {mae}")
-    print(f"Global WAPE (W{args.start_week}-W12): {wape}%")
-    print(f"Avg_Pearson (W{args.start_week}-W12): {avg_pearson:.4f}")
-    print(f"Avg_DTW (W{args.start_week}-W12): {avg_dtw:.4f}")
+    _print_main_metrics(
+        forecast_df,
+        top_k=args.top_k,
+        start_week=args.start_week,
+        mae=mae,
+        wape=wape,
+        avg_pearson=avg_pearson,
+        avg_dtw=avg_dtw,
+    )
 
     if ref_group_summary_stats is not None:
         print("\n=== Neighbor ref-curve group stats (per test_code×test_retail, W{}+) ===".format(args.start_week))
@@ -542,28 +594,20 @@ if __name__ == "__main__":
         flat = ref_group_flat_means_from_summary(summary_stats_to_jsonable(ref_group_summary_stats))
         print(f"flat_means: {flat}")
 
-    compare_topk_list = _parse_topk_list(args.compare_topk)
-    if compare_topk_list:
-        print("\n=== WAPE Compare ===")
-        for k in compare_topk_list:
-            _, fc_k, mae_k, wape_k, ap_k, dtw_k, _, _ = run_similarity_wape(
-                test_df=test_df,
-                train_df=train_df,
-                top_k=k,
-                start_week=args.start_week,
-            )
-            print(
-                f"Top{k:<2} -> Samples: {len(fc_k):>3}, "
-                f"MAE: {mae_k:.3f}, WAPE: {wape_k:.3f}%, "
-                f"Avg_P: {ap_k:.4f}, Avg_DTW: {dtw_k:.4f}"
-            )
+    _print_compare_topk(
+        compare_topk_list=_parse_topk_list(args.compare_topk),
+        test_df=test_df,
+        train_df=train_df,
+        start_week=args.start_week,
+    )
+    _save_outputs(
+        save_prefix=args.save_prefix,
+        final_ref_df=final_ref_df,
+        forecast_df=forecast_df,
+        ref_group_per_sku_df=ref_group_per_sku_df,
+        ref_group_summary_stats=ref_group_summary_stats,
+    )
 
-    if args.save_prefix:
-        ref_path = f"{args.save_prefix}_final_ref.csv"
-        forecast_path = f"{args.save_prefix}_forecast.csv"
-        final_ref_df.to_csv(ref_path, index=False)
-        forecast_df.to_csv(forecast_path, index=False)
-        print(f"Saved: {ref_path}")
-        print(f"Saved: {forecast_path}")
-        if ref_group_per_sku_df is not None and ref_group_summary_stats is not None:
-            save_ref_group_artifacts(args.save_prefix, ref_group_per_sku_df, ref_group_summary_stats)
+
+if __name__ == "__main__":
+    main()

@@ -5,50 +5,15 @@ import torch
 import pandas as pd
 import numpy as np
 import pytorch_lightning as pl
-from tqdm import tqdm
-from models.GTM import GTM
-from models.FCN import FCN
 from utils.data_multitrends import ZeroShotDataset
 from pathlib import Path
-from sklearn.metrics import mean_absolute_error
-from pathlib import Path
 
-from utils.curve_eval_metrics import avg_pearson_avg_dtw
-
-
-def _torch_load_trusted(path: Path):
-    """
-    PyTorch 2.6+ 默认 torch.load(weights_only=True) 会拒绝加载包含 numpy/非纯权重对象的 .pt。
-    本脚本用于加载 checkpoint/data dict，因此显式关闭 weights_only。
-    """
-    try:
-        return torch.load(str(path), map_location="cpu", weights_only=False)
-    except TypeError:
-        return torch.load(str(path), map_location="cpu")
-
-
-def cal_error_metrics(gt, forecasts):
-    # Absolute errors
-    mae = mean_absolute_error(gt, forecasts)
-    wape = 100 * np.sum(np.sum(np.abs(gt - forecasts), axis=-1)) / np.sum(gt)
-
-    return round(mae, 3), round(wape, 3)
-    
-
-def print_error_metrics(
-    y_test,
-    y_hat,
-    rescaled_y_test,
-    rescaled_y_hat,
-    *,
-    wsl: int = 0,
-    tw: int | None = None,
-):
-    mae, wape = cal_error_metrics(y_test, y_hat)
-    rescaled_mae, rescaled_wape = cal_error_metrics(rescaled_y_test, rescaled_y_hat)
-    print(mae, wape, rescaled_mae, rescaled_wape)
-    ap, adtw = avg_pearson_avg_dtw(rescaled_y_test, rescaled_y_hat, wsl=wsl, tw=tw)
-    print(f"Avg_Pearson {ap:.4f}  Avg_DTW {adtw:.4f}  (window [{wsl}:{tw if tw is not None else rescaled_y_test.shape[1]}), rescaled sales)")
+from utils.inference_utils import (
+    load_model_from_checkpoint,
+    run_forecast_inference,
+    torch_load_trusted,
+)
+from utils.forecast_metrics import print_error_metrics
 
 def run(args):
     print(args)
@@ -64,9 +29,9 @@ def run(args):
     item_codes = test_df['external_code'].values
 
      # Load category and color encodings
-    cat_dict = _torch_load_trusted(Path(args.data_folder + 'category_labels.pt'))
-    col_dict = _torch_load_trusted(Path(args.data_folder + 'color_labels.pt'))
-    fab_dict = _torch_load_trusted(Path(args.data_folder + 'fabric_labels.pt'))
+    cat_dict = torch_load_trusted(Path(args.data_folder + 'category_labels.pt'))
+    col_dict = torch_load_trusted(Path(args.data_folder + 'color_labels.pt'))
+    fab_dict = torch_load_trusted(Path(args.data_folder + 'fabric_labels.pt'))
 
     # Load Google trends
     gtrends = pd.read_csv(Path(args.data_folder + 'gtrends.csv'), index_col=[0], parse_dates=True)
@@ -78,70 +43,22 @@ def run(args):
     model_savename = f'{args.wandb_run}_{args.output_dim}'
     
     # Create model
-    model = None
-    if args.model_type == 'FCN':
-        model = FCN(
-            embedding_dim=args.embedding_dim,
-            hidden_dim=args.hidden_dim,
-            output_dim=args.output_dim,
-            cat_dict=cat_dict,
-            col_dict=col_dict,
-            fab_dict=fab_dict,
-            use_trends=args.use_trends,
-            use_text=args.use_text,
-            use_img=args.use_img,
-            trend_len=args.trend_len,
-            num_trends=args.num_trends,
-            use_encoder_mask=args.use_encoder_mask,
-            gpu_num=args.gpu_num
-        )
-    else:
-        model = GTM(
-            embedding_dim=args.embedding_dim,
-            hidden_dim=args.hidden_dim,
-            output_dim=args.output_dim,
-            num_heads=args.num_attn_heads,
-            num_layers=args.num_hidden_layers,
-            cat_dict=cat_dict,
-            col_dict=col_dict,
-            fab_dict=fab_dict,
-            use_text=args.use_text,
-            use_img=args.use_img,
-            trend_len=args.trend_len,
-            num_trends=args.num_trends,
-            use_encoder_mask=args.use_encoder_mask,
-            autoregressive=args.autoregressive,
-            gpu_num=args.gpu_num,
-            use_hist_sales=args.use_hist_sales,
-        )
-    
-    ckpt = _torch_load_trusted(Path(args.ckpt_path))
-    model.load_state_dict(ckpt['state_dict'] if isinstance(ckpt, dict) and 'state_dict' in ckpt else ckpt, strict=False)
+    model = load_model_from_checkpoint(
+        args,
+        cat_dict=cat_dict,
+        col_dict=col_dict,
+        fab_dict=fab_dict,
+        ckpt_path=Path(args.ckpt_path),
+    )
 
     # Forecast the testing set
-    model.to(device)
-    model.eval()
-    gt, forecasts = [], []
-    for test_data in tqdm(test_loader, total=len(test_loader), ascii=True):
-        with torch.no_grad():
-            test_data = [tensor.to(device) for tensor in test_data]
-            item_sales, recent_sales_2w, category, color, textures, temporal_features, gtrends, images = test_data
-            if args.model_type == 'FCN':
-                y_pred = model(category, color, textures, temporal_features, gtrends, images)
-            else:
-                y_pred = model(
-                    category,
-                    color,
-                    textures,
-                    temporal_features,
-                    gtrends,
-                    images,
-                    recent_sales_2w=recent_sales_2w,
-                )
-            forecasts.append(y_pred.detach().cpu().numpy().flatten()[:args.output_dim])
-            gt.append(item_sales.detach().cpu().numpy().flatten()[:args.output_dim])
-    forecasts = np.array(forecasts)
-    gt = np.array(gt)
+    forecasts, gt = run_forecast_inference(
+        model=model,
+        test_loader=test_loader,
+        device=device,
+        model_type=args.model_type,
+        output_dim=args.output_dim,
+    )
 
     # 销量 Maximum scaling: normalized = raw / train_global_max；此处 × normalization_scale 即还原 raw。
     # 见论文仓库 issue: global max over training set.
@@ -171,7 +88,7 @@ if __name__ == '__main__':
 
     # Model specific arguments
     parser.add_argument('--model_type', type=str, default='GTM', help='Choose between GTM or FCN')
-    parser.add_argument('--use_trends', type=int, default=1)
+    parser.add_argument('--use_trends', type=int, default=1, help='FCN 使用；GTM 固定使用 trends memory')
     parser.add_argument('--use_img', type=int, default=1)
     parser.add_argument('--use_text', type=int, default=1)
     parser.add_argument(
@@ -187,8 +104,8 @@ if __name__ == '__main__':
     parser.add_argument('--output_dim', type=int, default=12)
     parser.add_argument('--use_encoder_mask', type=int, default=1)
     parser.add_argument('--autoregressive', type=int, default=0)
-    parser.add_argument('--num_attn_heads', type=int, default=4)
-    parser.add_argument('--num_hidden_layers', type=int, default=1)
+    parser.add_argument('--num_attn_heads', type=int, default=4, help='CLI 桥接到 GTM 构造参数 num_heads')
+    parser.add_argument('--num_hidden_layers', type=int, default=1, help='CLI 桥接到 GTM 构造参数 num_layers')
     
     # wandb arguments
     parser.add_argument('--wandb_run', type=str, default='Run1')

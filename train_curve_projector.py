@@ -29,6 +29,7 @@ from modules.curve_metric_projector import (
     pearson_r_batch,
     transform_with_pca,
 )
+from utils.common_utils import sample_train_df
 from utils.curve_eval_metrics import avg_pearson_avg_dtw
 from utils.ref_group_curve_stats import (
     ref_group_flat_means_from_summary,
@@ -49,15 +50,6 @@ def _read_tabular(path: str, nrows: int | None = None) -> pd.DataFrame:
     if nrows is not None:
         read_kw["nrows"] = int(nrows)
     return pd.read_csv(path, **read_kw)
-
-
-def sample_train_df(df: pd.DataFrame, train_frac: float, seed: int) -> pd.DataFrame:
-    """与 export_item_embeddings / train.py 一致：仅对 train 子集抽样。"""
-    if not (0.0 < train_frac <= 1.0):
-        raise ValueError(f"train_frac must be in (0, 1], got {train_frac}")
-    if train_frac < 1.0:
-        return df.sample(frac=train_frac, random_state=seed).reset_index(drop=True)
-    return df.reset_index(drop=True)
 
 
 def _stack_curve_series(series: pd.Series) -> np.ndarray:

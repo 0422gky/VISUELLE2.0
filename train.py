@@ -8,23 +8,11 @@ import inspect
 from pytorch_lightning import loggers as pl_loggers
 from pathlib import Path
 from datetime import datetime
-from models.GTM import GTM
-from models.FCN import FCN
+from models.model_factory import build_model_from_args
+from utils.common_utils import torch_load_trusted
 from utils.data_multitrends import ZeroShotDataset
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-
-def _torch_load_trusted(path: Path):
-    """
-    PyTorch 2.6+ 默认 torch.load(weights_only=True) 会拒绝加载包含 numpy/非纯权重对象的 .pt。
-    本项目的 category/color/fabric label 本质上是 dict/标签映射，通常你是信任该来源的。
-    """
-    try:
-        return torch.load(str(path), map_location="cpu", weights_only=False)
-    except TypeError:
-        # 兼容老版本 PyTorch（没有 weights_only 参数）
-        return torch.load(str(path), map_location="cpu")
 
 
 def run(args):
@@ -39,9 +27,9 @@ def run(args):
     test_df = pd.read_csv(Path(args.data_folder + 'test.csv'), parse_dates=['release_date'])
 
     # Load category and color encodings
-    cat_dict = _torch_load_trusted(Path(args.data_folder + 'category_labels.pt'))
-    col_dict = _torch_load_trusted(Path(args.data_folder + 'color_labels.pt'))
-    fab_dict = _torch_load_trusted(Path(args.data_folder + 'fabric_labels.pt'))
+    cat_dict = torch_load_trusted(Path(args.data_folder + 'category_labels.pt'))
+    col_dict = torch_load_trusted(Path(args.data_folder + 'color_labels.pt'))
+    fab_dict = torch_load_trusted(Path(args.data_folder + 'fabric_labels.pt'))
 
     # Load Google trends
     gtrends = pd.read_csv(Path(args.data_folder + 'gtrends.csv'), index_col=[0], parse_dates=True)
@@ -53,41 +41,12 @@ def run(args):
                                   fab_dict, args.trend_len).get_loader(batch_size=1, train=False, lazy=lazy)
 
     # Create model
-    if args.model_type == 'FCN':
-        model = FCN(
-            embedding_dim=args.embedding_dim,
-            hidden_dim=args.hidden_dim,
-            output_dim=args.output_dim,
-            cat_dict=cat_dict,
-            col_dict=col_dict,
-            fab_dict=fab_dict,
-            use_trends=args.use_trends,
-            use_text=args.use_text,
-            use_img=args.use_img,
-            trend_len=args.trend_len,
-            num_trends=args.num_trends,
-            use_encoder_mask=args.use_encoder_mask,
-            gpu_num=args.gpu_num
-        )
-    else:
-        model = GTM(
-            embedding_dim=args.embedding_dim,
-            hidden_dim=args.hidden_dim,
-            output_dim=args.output_dim,
-            num_heads=args.num_attn_heads,
-            num_layers=args.num_hidden_layers,
-            cat_dict=cat_dict,
-            col_dict=col_dict,
-            fab_dict=fab_dict,
-            use_text=args.use_text,
-            use_img=args.use_img,
-            trend_len=args.trend_len,
-            num_trends=args.num_trends,
-            use_encoder_mask=args.use_encoder_mask,
-            autoregressive=args.autoregressive,
-            gpu_num=args.gpu_num,
-            use_hist_sales=args.use_hist_sales,
-        )
+    model = build_model_from_args(
+        args,
+        cat_dict=cat_dict,
+        col_dict=col_dict,
+        fab_dict=fab_dict,
+    )
 
     # Model Training
     # Define model saving procedure
@@ -157,7 +116,7 @@ if __name__ == '__main__':
 
     # Model specific arguments
     parser.add_argument('--model_type', type=str, default='GTM', help='Choose between GTM or FCN')
-    parser.add_argument('--use_trends', type=int, default=1)
+    parser.add_argument('--use_trends', type=int, default=1, help='FCN 使用；GTM 固定使用 trends memory')
     parser.add_argument('--use_img', type=int, default=1)
     parser.add_argument('--use_text', type=int, default=1)
     parser.add_argument(
@@ -180,8 +139,8 @@ if __name__ == '__main__':
     parser.add_argument('--output_dim', type=int, default=12)
     parser.add_argument('--use_encoder_mask', type=int, default=1)
     parser.add_argument('--autoregressive', type=int, default=0)
-    parser.add_argument('--num_attn_heads', type=int, default=4)
-    parser.add_argument('--num_hidden_layers', type=int, default=1)
+    parser.add_argument('--num_attn_heads', type=int, default=4, help='CLI 桥接到 GTM 构造参数 num_heads')
+    parser.add_argument('--num_hidden_layers', type=int, default=1, help='CLI 桥接到 GTM 构造参数 num_layers')
 
     # wandb arguments
     parser.add_argument('--wandb_entity', type=str, default='username-here')

@@ -1,230 +1,191 @@
-# GTM-Transformer
-Official Pytorch Implementation of [**Well Googled is Half Done: Multimodal Forecasting of New Fashion Product Sales with Image-based Google Trends**](https://arxiv.org/abs/2109.09824) paper
+# GTM-Transformer (VISUELLE2.0)
 
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/well-googled-is-half-done-multimodal/new-product-sales-forecasting-on-visuelle)](https://paperswithcode.com/sota/new-product-sales-forecasting-on-visuelle?p=well-googled-is-half-done-multimodal)
+本仓库用于销量预测，核心流程是：
+`训练模型 -> 推理/导出 embedding -> 相似度检索评估(WAPE) ->  projector 增强`。
 
-## env settings
-```bash
-export HF_ENDPOINT=https://hf-mirror.com
-# 关闭wandb
-# 设置pip为镜像源
-tmux attach -t my_training_session
+原论文：  
+[Well Googled is Half Done: Multimodal Forecasting of New Fashion Product Sales with Image-based Google Trends](https://arxiv.org/abs/2109.09824)
+
+## 1. Train & Inference Routes
+
+```mermaid
+flowchart TD
+    dataPrep[Prepare Dataset Files] --> trainModel[Run Train]
+    trainModel --> inferMetrics[Run Forecast]
+    trainModel --> exportEmb[Export Item Embeddings]
+    exportEmb --> trainProjector[Train Curve Projector]
+    trainProjector --> applyProjector[Run Apply Curve Projector]
+    exportEmb --> simEval[Run Similarity Wape Pipeline]
+    applyProjector --> simEval
 ```
 
-## 使用了全部`train`的ckpt
-```
-/data/coding/tmp_GTM_transformer/log/GTM/GTM_Run1---epoch=104---02-04-2026-21-00-31.ckpt
-```
+## 2. File Descriptions
 
-## Installation
+- `train.py`：训练 `GTM/FCN`。
+- `forecast.py`：推理并输出指标与 `results/*.pth`。
+- `forecast_csv.py`：推理并导出可读预测 CSV。
+- `export_item_embeddings.py`：导出 train/test/all 的 embedding 与曲线表。
+- `similarity_wape_pipeline.py`：基于 embedding 的检索评估（MAE/WAPE/曲线指标）。
+- `train_curve_projector.py`：训练对比学习 projector
+- `apply_curve_projector.py`：将 projector 应用于 train/test embedding
+- `run_similarity_wape_with_projected.py`：`similarity_wape_pipeline.py` 检测最终 inference 结果 wape
 
-We suggest the use of VirtualEnv.
+## 3. Data Input (Visuelle2.0)
 
-```bash
+`<DATA_DIR>/` 下至少包含：
 
-python3 -m venv gtm_venv
-source gtm_venv/bin/activate
-# gtm_venv\Scripts\activate.bat # If you're running on Windows
+- `train.csv`, `test.csv`
+- `gtrends.csv`
+- `images/`
+- `category_labels.pt`, `color_labels.pt`, `fabric_labels.pt`
+- `normalization_scale.npy`（用于反归一化）
 
-pip install numpy pandas matplotlib opencv-python permetrics Pillow scikit-image scikit-learn scipy tqdm transformers fairseq wandb
-
-pip install torch torchvision
-
-# For CUDA11.1 (NVIDIA 3K Serie GPUs)
-# Check official pytorch installation guidelines for your system
-pip install torch==1.9.0+cu111 torchvision==0.10.0+cu111 -f https://download.pytorch.org/whl/torch_stable.html
-
-pip install pytorch-lightning
-
-export INSTALL_DIR=$PWD
-
-cd $INSTALL_DIR
-git clone https://github.com/HumaticsLAB/GTM-Transformer.git
-cd GTM-Transformer
-mkdir ckpt
-mkdir dataset
-mkdir results
-
-unset INSTALL_DIR
-```
-
-## Dataset
-
-**VISUELLE** dataset is publicly available to download [here](https://forms.gle/cVGQAmxhHf7eRJ937). Please download and extract it inside the dataset folder.
-
-## Training
-To train the model of GTM-Transformer please use the following scripts. Please check the arguments inside the script before launch.
+## 4. Env Settings
 
 ```bash
-python train.py --data_folder dataset
+# python=3.10.8 pip=22.0.2 
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+
+pip install -r requirements.txt
 ```
 
+## 5. Quick Start
+
+### 5.1 Train
+
 ```bash
-python train.py --data_folder "visuelle2/" --gpu_num 0 --model_type GTM --train_frac 1
+python train.py \
+  --data_folder "<DATA_DIR>/" \
+  --gpu_num 0 \
+  --model_type GTM \
+  --train_frac 1.0 \
+  --lazy_loader 1 \
+  --use_hist_sales 0 \
+  --wandb_entity "<ENTITY>" \
+  --wandb_proj "GTM" \
+  --wandb_run "Run1"
 ```
 
-## Inference
-To evaluate the model of GTM-Transformer please use the following script .Please check the arguments inside the script before launch.
+### 5.2 forecast
 
 ```bash
-python forecast.py --data_folder dataset --ckpt_path ckpt/model.pth
+python forecast.py \
+  --data_folder "<DATA_DIR>/" \
+  --ckpt_path "<CKPT_PATH>" \
+  --gpu_num 0 \
+  --model_type GTM \
+  --output_dim 12 \
+  --lazy_loader 1 \
+  --use_hist_sales 0 \
+  --wandb_run "Run1"
+```
 
-python forecast.py --data_folder "visuelle2/" --ckpt_path "log/GTM/GTM_Run1---epoch=29---25-03-2026-13-17-24.ckpt"
+### 5.3 export forecast results
 
+```bash
+python forecast_csv.py \
+  --data_folder "<DATA_DIR>/" \
+  --ckpt_path "<CKPT_PATH>" \
+  --gpu_num 0 \
+  --model_type GTM \
+  --output_dim 12 \
+  --output_csv "results/forecast.csv" \
+  --lazy_loader 1 \
+  --use_hist_sales 0 \
+  --wide_sales_weeks
+```
 
-python forecast_csv.py --data_folder "visuelle2/" --ckpt_path "log/GTM/GTM_Run1---epoch=169---27-03-2026-11-28-07.ckpt" --output_dim 12 --gpu_num 0 --output_csv results/my_forecast.csv
+Optional: use the denormalization file（`normalization_scale.npy`）：
 
+- set the global max sales：`--rescale_max <GLOBAL_MAX>`
+- 从 `train.csv` 前 12 周自动计算：`--scale_from_train_max --train_csv train.csv --num_week_cols 12`
 
-python forecast_csv.py --data_folder "visuelle2/" --ckpt_path "log/GTM/GTM_Run1---epoch=44---31-03-2026-13-15-01.ckpt" --output_dim 12 --gpu_num 0 --output_csv results/my_forecast.csv
+### 5.4 export item embeddings
 
-python forecast_csv.py --data_folder "visuelle2/" --ckpt_path "log/GTM/GTM_Run1---epoch=104---02-04-2026-21-00-31.ckpt" --output_dim 12 --gpu_num 0 --output_csv results/my_forecast.csv
+```bash
+python export_item_embeddings.py \
+  --checkpoint "<CKPT_PATH>" \
+  --data_folder "<DATA_DIR>/" \
+  --output_dir "outputs" \
+  --split all \
+  --gpu_num 0 \
+  --device cuda \
+  --lazy_loader 1 \
+  --use_hist_sales 0 \
+  --output_format compact \
+  --compact_storage parquet \
+  --train_frac 1.0 \
+  --seed 21
+```
 
-cd /data/coding/tmp_GTM_transformer
+### 5.5 similarity & wape 
+
+```bash
 python similarity_wape_pipeline.py \
-  --train_csv outputs/train_item_embeddings.csv \
-  --test_csv outputs/test_item_embeddings.csv \
+  --train_csv "outputs/train_item_embeddings.parquet" \
+  --test_csv "outputs/test_item_embeddings.parquet" \
   --top_k 20 \
   --start_week 2 \
-  --save_prefix results/sim_wape \
-  --compare_topk 1,5,20
+  --compare_topk 1,5,20 \
+  --save_prefix "results/sim_wape/run1"
 ```
 
-## Export Item Embedddings
-export：test
-```bash
-python export_item_embeddings.py --checkpoint "path/to/your.ckpt" --data_folder "dataset/" --split test --output_dir "outputs/"
-```
+## 6. Projector
 
-export: train
-```bash
-python export_item_embeddings.py --checkpoint "path/to/your.ckpt" --data_folder "dataset/" --split train --output_dir "outputs/"
-```
-
-export: all
-```bash
-python export_item_embeddings.py --checkpoint "path/to/your.ckpt" --data_folder "dataset/" --split all --output_dir "outputs/"
-```
+### 6.1 train projector
 
 ```bash
-# example of ckpt path and export item embeddings
-tmp_GTM_transformer/log/GTM/GTM_Run1---epoch=29---25-03-2026-13-17-24.ckpt
-
-python export_item_embeddings.py --checkpoint "log/GTM/GTM_Run1---epoch=29---25-03-2026-13-17-24.ckpt" --data_folder "visuelle2/" --split all --output_dir "outputs/"
-
-python export_item_embeddings.py --checkpoint "log/GTM/GTM_Run1---epoch=104---02-04-2026-21-00-31.ckpt" --data_folder "visuelle2/" --split all --output_dir "outputs/"
+python train_curve_projector.py \
+  --train_embeddings_npy "outputs/train_item_embeddings.npy" \
+  --train_curves_csv "outputs/train_item_embeddings.parquet" \
+  --output_dir "results/curve_projector" \
+  --epochs 20 \
+  --pca_components 0 \
+  --device cuda \
+  --train_frac 1.0 \
+  --train_sample_seed 21
 ```
 
-## Citation
+### 6.2 apply projector
+
+```bash
+python apply_curve_projector.py \
+  --projector_dir "results/curve_projector" \
+  --train_embeddings_npy "outputs/train_item_embeddings.npy" \
+  --test_embeddings_npy "outputs/test_item_embeddings.npy" \
+  --output_dir "results/curve_projector/projected" \
+  --device cuda
 ```
+
+### 6.3 reevaluate using projected embeddings
+
+```bash
+python similarity_wape_pipeline.py \
+  --train_csv "outputs/train_item_embeddings.parquet" \
+  --test_csv "outputs/test_item_embeddings.parquet" \
+  --train_emb_npy "results/curve_projector/projected/train_item_embeddings_projected.npy" \
+  --test_emb_npy "results/curve_projector/projected/test_item_embeddings_projected.npy" \
+  --top_k 20 \
+  --start_week 2 \
+  --save_prefix "results/sim_wape/projected"
+```
+
+
+
+## 7. FAQs
+
+- 显存不足：优先启用 `--lazy_loader 1`，并减小 batch。
+- 输出列名里有 `*_restored` 但数值看起来仍很小：这通常是归一化空间或反归一化配置不一致导致。
+
+## 8. Citation
+
+```text
 @misc{skenderi2021googled,
-      title={Well Googled is Half Done: Multimodal Forecasting of New Fashion Product Sales with Image-based Google Trends}, 
+      title={Well Googled is Half Done: Multimodal Forecasting of New Fashion Product Sales with Image-based Google Trends},
       author={Geri Skenderi and Christian Joppi and Matteo Denitto and Marco Cristani},
       year={2021},
       eprint={2109.09824},
 }
-```
-
-## 对比学习 metric learning projector
-```bash
-# 1) 在 GTM-Transformer 目录，用已导出的 train 向量训练（曲线与 npy 行对齐，如 train.csv 或带 sales_wk_* 的导出表）
-python train_curve_projector.py --train_embeddings_npy outputs/train_item_embeddings.npy --train_curves_csv outputs/train_item_embeddings.parquet --output_dir results/curve_projector --epochs 20 --pca_components 0 
-
-# 2) 生成投影后的 train/test npy
-python apply_curve_projector.py --projector_dir results/curve_projector --train_embeddings_npy outputs/train_item_embeddings.npy  --test_embeddings_npy outputs/test_item_embeddings.npy --output_dir results/curve_projector/projected
-
-# 3) WAPE（ GTM-Transformer 下用 run_similarity_wape_with_projected.py） 这个是使用了对比学习的metric 有对比学习，没有PCA
-python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.parquet --test_csv outputs/test_item_embeddings.parquet   --train_emb_npy results/curve_projector/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector/WAPE_results
-
-
-# 不使用对比学习trick跑的 WAPE 没有对比学习/PCA
-python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.parquet --test_csv outputs/test_item_embeddings.parquet   --train_emb_npy outputs/train_item_embeddings.npy   --test_emb_npy outputs/test_item_embeddings.npy --save_prefix results/curve_nonprojected/WAPE_results
-```
-
-
-## 带有PCA的projector
-
-```bash
-python train_curve_projector.py \
-  --train_embeddings_npy outputs/train_item_embeddings.npy \
-  --train_curves_csv outputs/train_item_embeddings.parquet \
-  --output_dir results/curve_projector_pca \
-  --pca_components 32 \
-  --epochs 20
-
-
-python apply_curve_projector.py \
-  --projector_dir results/curve_projector_pca \
-  --train_embeddings_npy outputs/train_item_embeddings.npy \
-  --test_embeddings_npy outputs/test_item_embeddings.npy \
-  --output_dir results/curve_projector_pca/projected \
-  --device cuda
-
-# 对比学习+PCA
-python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.parquet --test_csv outputs/test_item_embeddings.parquet   --train_emb_npy results/curve_projector_pca/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector_pca/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector_pca/WAPE_results
-
-```
-
-## sim wape pipeline
-
-这里才能看Avg_pairwise_corr等四个参数
-'Avg_pairwise_corr': 
-'Avg_cv_total': 
-'Avg_cv_week'
-'Avg_sim': 
-
-
-## 0销量数据 zero-shot cold start
-```bash
-# 使用outputs_44_frac4下的数据(仅为远端linux示例)，实际复现时请自己训练不带有2 weeks 销量作为embedding的数据
-
-python similarity_wape_pipeline.py  --train_csv outputs_44_frac4/train_item_embeddings.parquet  --test_csv outputs_44_frac4/test_item_embeddings.parquet  --top_k 20  --start_week 2  --save_prefix results/sim_wape  --compare_topk 1,5,20
-```
-
-## ablation study
-1. 不使用Google trends数据（只是在导出emebddings时置为0，并不是前面训练GTM不用，只是为了工程方便）
-
-```bash
-python export_item_embeddings.py --checkpoint "log/GTM/GTM_Run1---epoch=104---02-04-2026-21-00-31.ckpt"   --data_folder "visuelle2/"   --output_dir outputs_ablate_trends --split all --ablate_trends 1
-```
-
-
-
-消融projector
-```bash
-python train_curve_projector.py --train_embeddings_npy outputs_ablate_trends/train_item_embeddings.npy  --train_curves_csv outputs_ablate_trends/train_item_embeddings.parquet  --output_dir results/curve_projector_ablate_trends --epochs 20
-
-python apply_curve_projector.py --projector_dir results/curve_projector_ablate_trends  --train_embeddings_npy outputs_ablate_trends/train_item_embeddings.npy  --test_embeddings_npy outputs_ablate_trends/test_item_embeddings.npy  --output_dir results/curve_projector_ablate_trends/projected
-
-最后 similarity_wape_pipeline
-
-python similarity_wape_pipeline.py --train_csv outputs_ablate_trends/train_item_embeddings.parquet --test_csv outputs_ablate_trends/test_item_embeddings.parquet   --train_emb_npy results/curve_projector_ablate_trends/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector_ablate_trends/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector_ablate_trends/WAPE_results
-```
-
-## ablation study 2: fabric + color + category + images
-```bash
-python export_item_embeddings.py \
-  --checkpoint <CKPT_PATH> \
-  --data_folder <DATA_FOLDER> \
-  --output_dir outputs_ablation2 \
-  --split all \
-  --ablation2_ccf_img 1
-
-python train_curve_projector.py \
-  --train_embeddings_npy outputs_ablation2/train_item_embeddings.npy \
-  --train_curves_csv outputs_ablation2/train_item_embeddings.parquet \
-  --output_dir results/curve_projector_ablation2 \
-  --epochs 20
-
-python apply_curve_projector.py \
-  --projector_dir results/curve_projector_ablation2 \
-  --train_embeddings_npy outputs_ablation2/train_item_embeddings.npy \
-  --test_embeddings_npy outputs_ablation2/test_item_embeddings.npy \
-  --output_dir results/curve_projector_ablation2/projected
-
-python similarity_wape_pipeline.py \
-  --train_csv outputs_ablation2/train_item_embeddings.parquet \
-  --test_csv outputs_ablation2/test_item_embeddings.parquet \
-  --train_emb_npy results/curve_projector_ablation2/projected/train_item_embeddings_projected.npy \
-  --test_emb_npy results/curve_projector_ablation2/projected/test_item_embeddings_projected.npy \
-  --save_prefix results/curve_projector_ablation2/eval
 ```

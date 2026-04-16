@@ -13,6 +13,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from models.GTM import GTM
+from utils.common_utils import sample_train_df, torch_load_trusted
 from utils.data_multitrends import (
     LazyZeroShotDataset,
     ZeroShotDataset,
@@ -20,20 +21,8 @@ from utils.data_multitrends import (
 )
 
 
-def _torch_load_trusted(path: str):
-    """
-    PyTorch 2.6+ 默认 torch.load(weights_only=True) 会拒绝加载包含 numpy/非纯权重对象的 .pt。
-    本脚本加载的是数据字典/ckpt（你一般是信任来源的），因此显式 weights_only=False。
-    """
-    try:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        # 兼容老版本 PyTorch（没有 weights_only 参数）
-        return torch.load(path, map_location="cpu")
-
-
 def _load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> None:
-    ckpt = _torch_load_trusted(checkpoint_path)
+    ckpt = torch_load_trusted(checkpoint_path)
     state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
     model.load_state_dict(state_dict, strict=False)
 
@@ -53,15 +42,6 @@ def _read_split_df(data_folder: str, split: str) -> pd.DataFrame:
     # parse_dates 用于满足 ZeroShotDataset.preprocess_data() 里的时间运算
     df = pd.read_csv(csv_path, parse_dates=["release_date"])
     return df
-
-
-def sample_train_df(df: pd.DataFrame, train_frac: float, seed: int) -> pd.DataFrame:
-    """与 train.py 一致：仅对 train 子集抽样。"""
-    if not (0.0 < train_frac <= 1.0):
-        raise ValueError(f"train_frac must be in (0, 1], got {train_frac}")
-    if train_frac < 1.0:
-        return df.sample(frac=train_frac, random_state=seed).reset_index(drop=True)
-    return df.reset_index(drop=True)
 
 
 def _release_date_slash(val) -> str:
@@ -461,9 +441,9 @@ def main():
     args.device = torch.device(device_str)
 
     # load csv embeddings metadata (and dicts/models inputs)
-    cat_dict = _torch_load_trusted(os.path.join(args.data_folder, "category_labels.pt"))
-    col_dict = _torch_load_trusted(os.path.join(args.data_folder, "color_labels.pt"))
-    fab_dict = _torch_load_trusted(os.path.join(args.data_folder, "fabric_labels.pt"))
+    cat_dict = torch_load_trusted(os.path.join(args.data_folder, "category_labels.pt"))
+    col_dict = torch_load_trusted(os.path.join(args.data_folder, "color_labels.pt"))
+    fab_dict = torch_load_trusted(os.path.join(args.data_folder, "fabric_labels.pt"))
 
     args.cat_dict = cat_dict
     args.col_dict = col_dict
@@ -477,7 +457,7 @@ def main():
     )
 
     # Load checkpoint + hyper parameters (if available)
-    ckpt = _torch_load_trusted(args.checkpoint)
+    ckpt = torch_load_trusted(args.checkpoint)
     hparams = _extract_hparams(ckpt)
 
     def get_h(k, default):
