@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import argparse
 import ast
-from typing import Iterable, Tuple
+from typing import Iterable, Literal, Tuple
 
 import numpy as np
 import pandas as pd
@@ -138,6 +138,96 @@ def weighted_forecast(final_ref_df: pd.DataFrame) -> pd.DataFrame:
     return forecast_df
 
 
+def rolling_forecast_2w_1w(
+    final_ref_df: pd.DataFrame,
+    *,
+    input_weeks: int = 2,
+    teacher_forcing: bool = False,
+    dyn_temp: float = 1.0,
+    eps: float = 1e-8,
+) -> pd.DataFrame:
+    """
+    基于已检索的 Top-K 邻居，执行「2周->1周」滚动预测。
+
+    说明：
+    - 邻居集合固定（由 embedding 相似度检索得到）；
+    - 每一步 t 使用最近 input_weeks 周历史，和每个邻居在同窗口的模式差异计算动态权重；
+    - teacher_forcing=False 时用“预测历史”递推；True 时用“真实历史”递推。
+    """
+    required = {"test_code", "test_retail", "curve", "sim_score", "test_curve"}
+    miss = required - set(final_ref_df.columns)
+    if miss:
+        raise ValueError(f"final_ref_df 缺少列: {sorted(miss)}")
+    if input_weeks < 1:
+        raise ValueError("input_weeks 必须 >= 1。")
+
+    def _safe_base_weights(raw: np.ndarray) -> np.ndarray:
+        # 余弦相似度可能有负值；rolling 权重需非负
+        w = np.maximum(raw.astype(np.float64), 0.0)
+        s = float(np.sum(w))
+        if s <= 0:
+            return np.ones_like(w, dtype=np.float64) / float(len(w))
+        return w / s
+
+    rows = []
+    grouped = final_ref_df.groupby(["test_code", "test_retail"], group_keys=False)
+    for (test_code, test_retail), group in grouped:
+        neigh_curves = np.stack(group["curve"].values).astype(np.float64)  # (K, L)
+        true_curve = np.asarray(group["test_curve"].iloc[0], dtype=np.float64)  # (L,)
+        base_w = _safe_base_weights(group["sim_score"].to_numpy(dtype=np.float64))  # (K,)
+
+        if neigh_curves.ndim != 2:
+            raise ValueError(f"邻居曲线维度异常，应为 (K, L)，当前 {neigh_curves.shape}")
+        if true_curve.ndim != 1:
+            raise ValueError(f"真实曲线维度异常，应为 (L,)，当前 {true_curve.shape}")
+        if neigh_curves.shape[1] != true_curve.shape[0]:
+            raise ValueError(
+                f"邻居曲线与真实曲线长度不一致: {neigh_curves.shape[1]} vs {true_curve.shape[0]}"
+            )
+
+        L = int(true_curve.shape[0])
+        pred_curve = true_curve.copy()
+        if L <= input_weeks:
+            rows.append(
+                {
+                    "test_code": test_code,
+                    "test_retail": test_retail,
+                    "pred_curve": pred_curve.tolist(),
+                    "true_curve": true_curve.tolist(),
+                }
+            )
+            continue
+
+        # 逐周滚动：用最近 input_weeks 周预测下一周
+        for t in range(input_weeks, L):
+            hist_src = true_curve if teacher_forcing else pred_curve
+            test_hist = hist_src[t - input_weeks : t]  # (W,)
+            neigh_hist = neigh_curves[:, t - input_weeks : t]  # (K, W)
+            hist_err = np.mean(np.abs(neigh_hist - test_hist[None, :]), axis=1)  # (K,)
+
+            # 动态相似度：误差越小权重越大
+            dyn_w = np.exp(-hist_err / max(float(dyn_temp), eps))
+            w = base_w * dyn_w
+            ws = float(np.sum(w))
+            if ws <= 0:
+                w = np.ones_like(w, dtype=np.float64) / float(len(w))
+            else:
+                w = w / ws
+
+            pred_curve[t] = float(np.sum(w * neigh_curves[:, t]))
+
+        rows.append(
+            {
+                "test_code": test_code,
+                "test_retail": test_retail,
+                "pred_curve": pred_curve.tolist(),
+                "true_curve": true_curve.tolist(),
+            }
+        )
+
+    return pd.DataFrame(rows, columns=["test_code", "test_retail", "pred_curve", "true_curve"])
+
+
 def calc_mae_wape(
     gt_list: Iterable[Iterable[float]],
     pred_list: Iterable[Iterable[float]],
@@ -201,6 +291,9 @@ def run_similarity_wape(
     start_week: int = 2,
     embedding_col: str = "embedding",
     curve_col: str = "curve",
+    forecast_mode: Literal["static", "rolling_2w1w"] = "static",
+    rolling_teacher_forcing: bool = False,
+    rolling_dyn_temp: float = 1.0,
 ) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
@@ -227,7 +320,17 @@ def run_similarity_wape(
         embedding_col=embedding_col,
         curve_col=curve_col,
     )
-    forecast_df = weighted_forecast(final_ref_df)
+    if forecast_mode == "static":
+        forecast_df = weighted_forecast(final_ref_df)
+    elif forecast_mode == "rolling_2w1w":
+        forecast_df = rolling_forecast_2w_1w(
+            final_ref_df,
+            input_weeks=2,
+            teacher_forcing=rolling_teacher_forcing,
+            dyn_temp=rolling_dyn_temp,
+        )
+    else:
+        raise ValueError(f"未知 forecast_mode: {forecast_mode}")
     mae, wape = calc_mae_wape(
         gt_list=forecast_df["true_curve"],
         pred_list=forecast_df["pred_curve"],
@@ -457,6 +560,24 @@ if __name__ == "__main__":
         help="输出对比的 Top-K 列表，逗号分隔，例如: 1,5,20",
     )
     parser.add_argument(
+        "--forecast_mode",
+        type=str,
+        default="static",
+        choices=["static", "rolling_2w1w"],
+        help="预测方式: static=原始邻居加权整曲线；rolling_2w1w=2周->1周滚动递推",
+    )
+    parser.add_argument(
+        "--rolling_teacher_forcing",
+        action="store_true",
+        help="仅 rolling_2w1w 有效：每一步用真实历史2周做下一周预测（否则用预测历史递推）",
+    )
+    parser.add_argument(
+        "--rolling_dyn_temp",
+        type=float,
+        default=1.0,
+        help="仅 rolling_2w1w 有效：动态权重温度，越小越强调历史2周模式匹配",
+    )
+    parser.add_argument(
         "--train_emb_npy",
         default="",
         help="可选: (N,D) 投影后的 train embedding，行序须与 train_csv 一致，将覆盖 CSV 中的 embedding 列",
@@ -526,11 +647,20 @@ if __name__ == "__main__":
         train_df=train_df,
         top_k=args.top_k,
         start_week=args.start_week,
+        forecast_mode=args.forecast_mode,
+        rolling_teacher_forcing=args.rolling_teacher_forcing,
+        rolling_dyn_temp=args.rolling_dyn_temp,
     )
 
     print("=== Similarity Forecast Metrics ===")
     print(f"Samples: {len(forecast_df)}")
     print(f"Top-K: {args.top_k}")
+    print(f"Forecast mode: {args.forecast_mode}")
+    if args.forecast_mode == "rolling_2w1w":
+        print(
+            f"Rolling cfg: input_weeks=2, teacher_forcing={args.rolling_teacher_forcing}, "
+            f"dyn_temp={args.rolling_dyn_temp}"
+        )
     print(f"Global MAE (W{args.start_week}-W12): {mae}")
     print(f"Global WAPE (W{args.start_week}-W12): {wape}%")
     print(f"Avg_Pearson (W{args.start_week}-W12): {avg_pearson:.4f}")
@@ -551,6 +681,9 @@ if __name__ == "__main__":
                 train_df=train_df,
                 top_k=k,
                 start_week=args.start_week,
+                forecast_mode=args.forecast_mode,
+                rolling_teacher_forcing=args.rolling_teacher_forcing,
+                rolling_dyn_temp=args.rolling_dyn_temp,
             )
             print(
                 f"Top{k:<2} -> Samples: {len(fc_k):>3}, "

@@ -1,6 +1,15 @@
 """
 Train a metric-learning projector on frozen train item embeddings.
-Supervision: MSE between cosine(z_i, z_j) and Pearson(curve_i, curve_j).
+
+Composite loss (optional):
+  loss = topk_loss_coef * L_topk + lambda_metric * L_metric
+
+- L_metric: MSE between cosine(z_i,z_j) and Pearson(curve_i, curve_j) (random pairs).
+- L_topk: aligns with similarity_wape_pipeline static forecast — cosine similarity to a
+  random train pool, take Top-K (torch.topk), normalize weights like weighted_forecast(),
+  weighted mean of neighbor curves, MSE vs query curve (week slice aligns WAPE start_week).
+
+Does NOT compute GTM decoder FC loss; that stays in GTM.train.
 Uses train split only (no test leakage).
 """
 
@@ -16,6 +25,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 
@@ -136,6 +146,58 @@ def sample_disjoint_pairs(rng: np.random.Generator, n: int, batch: int) -> tuple
     return idx_i, idx_j
 
 
+def sample_query_and_pool_indices(
+    rng: np.random.Generator,
+    n: int,
+    batch_queries: int,
+    pool_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Query rows (pseudo test) and support pool rows (pseudo train archive). May overlap; masked in loss."""
+    b = min(int(batch_queries), n)
+    m = min(int(pool_size), n)
+    if b < 1 or m < 1:
+        raise ValueError("batch_queries and pool_size must allow at least one row each")
+    query_idx = rng.choice(n, size=b, replace=False).astype(np.int64)
+    pool_idx = rng.choice(n, size=m, replace=False).astype(np.int64)
+    return query_idx, pool_idx
+
+
+def topk_weighted_curve_mse(
+    z_q: torch.Tensor,
+    z_pool: torch.Tensor,
+    curves_pool: torch.Tensor,
+    curves_query: torch.Tensor,
+    pool_global_idx: torch.Tensor,
+    query_global_idx: torch.Tensor,
+    top_k: int,
+    start_idx: int,
+) -> torch.Tensor:
+    """
+    Same structure as similarity_wape_pipeline.build_similarity_refs (cosine) +
+    weighted_forecast (normalize weights, weighted average of curves).
+
+    z_q: (B, D), z_pool: (M, D) L2-normalized; cosine sim = z_q @ z_pool.T
+    start_idx: 0-based column index; default 1 matches calc_mae_wape(..., start_week=2).
+    """
+    sim = z_q @ z_pool.T
+    mask_self = pool_global_idx.unsqueeze(0) == query_global_idx.unsqueeze(1)
+    sim = sim.masked_fill(mask_self, float("-inf"))
+    k_eff = min(int(top_k), sim.shape[1])
+    vals, idx = torch.topk(sim, k=k_eff, dim=1)
+    weights = vals
+    w_sum = weights.sum(dim=1, keepdim=True)
+    uniform = torch.full_like(weights, 1.0 / float(k_eff))
+    weights = torch.where(w_sum > 0, weights / w_sum.clamp(min=1e-12), uniform)
+
+    c_top = curves_pool[idx]
+    pred = (weights.unsqueeze(-1) * c_top).sum(dim=1)
+    target = curves_query
+    if start_idx > 0:
+        pred = pred[:, start_idx:]
+        target = target[:, start_idx:]
+    return F.mse_loss(pred, target)
+
+
 def train_loop(
     model: CurveMetricProjector,
     X: np.ndarray,
@@ -146,47 +208,108 @@ def train_loop(
     batch_pairs: int,
     lr: float,
     seed: int,
-) -> list[float]:
+    topk_loss_coef: float = 0.0,
+    lambda_metric: float = 1.0,
+    top_k: int = 20,
+    pool_size: int = 512,
+    topk_query_batch: int = 32,
+    curve_loss_start_idx: int = 1,
+) -> tuple[list[float], list[float], list[float]]:
+    """
+    Returns (total_losses, metric_losses, topk_losses) per epoch (mean over steps).
+    topk_loss matches similarity_wape_pipeline: Top-K by cosine, weighted_forecast blend, MSE on curve tail.
+    """
     rng = np.random.default_rng(seed)
     opt = optim.Adam(model.parameters(), lr=lr)
     n = X.shape[0]
-    losses: list[float] = []
+
+    total_losses: list[float] = []
+    metric_losses_e: list[float] = []
+    topk_losses_e: list[float] = []
+
+    use_topk = topk_loss_coef > 0.0
+    use_metric = lambda_metric > 0.0
+    if not use_topk and not use_metric:
+        raise ValueError("At least one of topk_loss_coef or lambda_metric must be positive")
 
     model.train()
     for ep in range(epochs):
-        ep_loss = 0.0
+        ep_sum = 0.0
+        ep_metric = 0.0
+        ep_topk = 0.0
         n_batches = 0
+
         for _ in tqdm(range(steps_per_epoch), desc=f"epoch {ep+1}/{epochs}", leave=False):
-            idx_i, idx_j = sample_disjoint_pairs(rng, n, batch_pairs)
-            sim_curve = pearson_r_batch(curves, idx_i, idx_j)
-            valid = np.isfinite(sim_curve)
-            if not np.any(valid):
+            l_metric_t = torch.tensor(0.0, device=device)
+            l_topk_t = torch.tensor(0.0, device=device)
+            parts: list[torch.Tensor] = []
+
+            if use_metric:
+                idx_i, idx_j = sample_disjoint_pairs(rng, n, batch_pairs)
+                sim_curve = pearson_r_batch(curves, idx_i, idx_j)
+                valid = np.isfinite(sim_curve)
+                if np.any(valid):
+                    xi = torch.from_numpy(X[idx_i]).float().to(device)
+                    xj = torch.from_numpy(X[idx_j]).float().to(device)
+                    sc = torch.tensor(sim_curve, dtype=torch.float32, device=device)
+                    zi = model(xi)
+                    zj = model(xj)
+                    sim_emb = (zi * zj).sum(dim=-1)
+                    err = (sim_emb - sc) ** 2
+                    valid_t = torch.from_numpy(valid).to(device)
+                    l_metric_t = err[valid_t].mean()
+                    parts.append(lambda_metric * l_metric_t)
+
+            if use_topk:
+                q_idx, p_idx = sample_query_and_pool_indices(
+                    rng, n, topk_query_batch, pool_size
+                )
+                x_q = torch.from_numpy(X[q_idx]).float().to(device)
+                x_p = torch.from_numpy(X[p_idx]).float().to(device)
+                z_q = model(x_q)
+                z_p = model(x_p)
+                cq = torch.from_numpy(curves[q_idx]).float().to(device)
+                cp = torch.from_numpy(curves[p_idx]).float().to(device)
+                qg = torch.tensor(q_idx, device=device, dtype=torch.long)
+                pg = torch.tensor(p_idx, device=device, dtype=torch.long)
+                l_topk_t = topk_weighted_curve_mse(
+                    z_q,
+                    z_p,
+                    cp,
+                    cq,
+                    pg,
+                    qg,
+                    top_k=top_k,
+                    start_idx=curve_loss_start_idx,
+                )
+                parts.append(topk_loss_coef * l_topk_t)
+
+            if not parts:
                 continue
 
-            xi = torch.from_numpy(X[idx_i]).float().to(device)
-            xj = torch.from_numpy(X[idx_j]).float().to(device)
-            sc = torch.tensor(sim_curve, dtype=torch.float32, device=device)
-
-            opt.zero_grad()
-            zi = model(xi)
-            zj = model(xj)
-            sim_emb = (zi * zj).sum(dim=-1)
-            err = (sim_emb - sc) ** 2
-            valid_t = torch.from_numpy(valid).to(device)
-            loss = err[valid_t].mean()
+            loss = sum(parts)
             if torch.isnan(loss):
                 continue
+
+            opt.zero_grad()
             loss.backward()
             opt.step()
 
-            ep_loss += float(loss.item())
+            ep_sum += float(loss.item())
+            ep_metric += float(l_metric_t.detach().item())
+            ep_topk += float(l_topk_t.detach().item())
             n_batches += 1
 
-        avg = ep_loss / max(n_batches, 1)
-        losses.append(avg)
-        print(f"epoch {ep+1} mean loss: {avg:.6f}")
+        denom = max(n_batches, 1)
+        total_losses.append(ep_sum / denom)
+        metric_losses_e.append(ep_metric / denom)
+        topk_losses_e.append(ep_topk / denom)
+        print(
+            f"epoch {ep+1} mean loss: {total_losses[-1]:.6f}  "
+            f"(metric: {metric_losses_e[-1]:.6f}, topk_wape_pipe: {topk_losses_e[-1]:.6f})"
+        )
 
-    return losses
+    return total_losses, metric_losses_e, topk_losses_e
 
 
 @torch.no_grad()
@@ -302,10 +425,49 @@ def main():
         help="极少用：在「一行一 SKU」的 train 导出表上算组统计（多数量弱）。"
         "与 exploration 一致的 Avg_sim/Avg_corr/CV 应对 similarity 的 final_ref 算，见 similarity_wape_pipeline --save_prefix。",
     )
+    parser.add_argument(
+        "--topk_loss_coef",
+        type=float,
+        default=0.0,
+        help="similarity_wape_pipeline 风格：随机 train 子集为 pool，对 query 做 cos Top-K + weighted_forecast 加权曲线，"
+        "与自身曲线算 MSE；0 表示关闭（仅 Pearson metric）。",
+    )
+    parser.add_argument(
+        "--lambda_metric",
+        type=float,
+        default=1.0,
+        help="Pearson–cosine MSE 项权重；(cos-r)^2。可与 topk_loss_coef 组合；二者均为 0 非法。",
+    )
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=20,
+        help="与 similarity_wape_pipeline / build_similarity_refs 中 Top-K 邻居数一致（训练时每步在 pool 内 topk）。",
+    )
+    parser.add_argument(
+        "--pool_size",
+        type=int,
+        default=512,
+        help="每步从 train 中无放回抽样的候选池大小（模拟检索库子集；越大越接近全库但更慢）。",
+    )
+    parser.add_argument(
+        "--topk_query_batch",
+        type=int,
+        default=32,
+        help="每步伪 query 条数（并行计算 Top-K 加权损失）。",
+    )
+    parser.add_argument(
+        "--curve_loss_start_idx",
+        type=int,
+        default=1,
+        help="曲线 MSE 起始列（0-based）。默认 1 对应 calc_mae_wape(..., start_week=2) 的周切片。",
+    )
     args = parser.parse_args()
 
     if not (0.0 < args.train_frac <= 1.0):
         raise ValueError(f"--train_frac must be in (0, 1], got {args.train_frac}")
+    if args.topk_loss_coef <= 0 and args.lambda_metric <= 0:
+        raise ValueError("Require --topk_loss_coef > 0 or --lambda_metric > 0")
 
     emb = np.load(args.train_embeddings_npy)
     train_df = load_train_df_for_projector(
@@ -372,6 +534,12 @@ def main():
         batch_pairs=args.batch_pairs,
         lr=args.lr,
         seed=args.seed,
+        topk_loss_coef=float(args.topk_loss_coef),
+        lambda_metric=float(args.lambda_metric),
+        top_k=int(args.top_k),
+        pool_size=int(args.pool_size),
+        topk_query_batch=int(args.topk_query_batch),
+        curve_loss_start_idx=int(args.curve_loss_start_idx),
     )
 
     nn_avg_pearson: float | None = None
@@ -411,6 +579,12 @@ def main():
         "output_dim": args.out_dim,
         "use_pca": pca is not None,
         "pca_n_components": int(pca.n_components_) if pca is not None else 0,
+        "topk_loss_coef": float(args.topk_loss_coef),
+        "lambda_metric": float(args.lambda_metric),
+        "top_k": int(args.top_k),
+        "pool_size": int(args.pool_size),
+        "topk_query_batch": int(args.topk_query_batch),
+        "curve_loss_start_idx": int(args.curve_loss_start_idx),
         "train_frac": float(args.train_frac),
         "train_sample_seed": int(args.train_sample_seed),
         "max_train_rows": args.max_train_rows,

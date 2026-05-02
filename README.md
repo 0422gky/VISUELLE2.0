@@ -202,29 +202,64 @@ python similarity_wape_pipeline.py --train_csv outputs_ablate_trends/train_item_
 
 ## ablation study 2: fabric + color + category + images
 ```bash
-python export_item_embeddings.py \
-  --checkpoint <CKPT_PATH> \
-  --data_folder <DATA_FOLDER> \
-  --output_dir outputs_ablation2 \
-  --split all \
-  --ablation2_ccf_img 1
+python export_item_embeddings.py --checkpoint "log/GTM/GTM_Run1---epoch=104---02-04-2026-21-00-31.ckpt"  --data_folder "visuelle2/" --output_dir outputs_ablation2  --split all  --ablation2_ccf_img 1
 
-python train_curve_projector.py \
-  --train_embeddings_npy outputs_ablation2/train_item_embeddings.npy \
-  --train_curves_csv outputs_ablation2/train_item_embeddings.parquet \
-  --output_dir results/curve_projector_ablation2 \
-  --epochs 20
+python train_curve_projector.py  --train_embeddings_npy outputs_ablation2/train_item_embeddings.npy   --train_curves_csv outputs_ablation2/train_item_embeddings.parquet  --output_dir results/curve_projector_ablation2 --epochs 20
 
-python apply_curve_projector.py \
-  --projector_dir results/curve_projector_ablation2 \
-  --train_embeddings_npy outputs_ablation2/train_item_embeddings.npy \
-  --test_embeddings_npy outputs_ablation2/test_item_embeddings.npy \
-  --output_dir results/curve_projector_ablation2/projected
+python apply_curve_projector.py --projector_dir results/curve_projector_ablation2  --train_embeddings_npy outputs_ablation2/train_item_embeddings.npy --test_embeddings_npy outputs_ablation2/test_item_embeddings.npy --output_dir results/curve_projector_ablation2/projected
 
-python similarity_wape_pipeline.py \
-  --train_csv outputs_ablation2/train_item_embeddings.parquet \
-  --test_csv outputs_ablation2/test_item_embeddings.parquet \
-  --train_emb_npy results/curve_projector_ablation2/projected/train_item_embeddings_projected.npy \
-  --test_emb_npy results/curve_projector_ablation2/projected/test_item_embeddings_projected.npy \
-  --save_prefix results/curve_projector_ablation2/eval
+python similarity_wape_pipeline.py --train_csv outputs_ablation2/train_item_embeddings.parquet --test_csv outputs_ablation2/test_item_embeddings.parquet --train_emb_npy results/curve_projector_ablation2/projected/train_item_embeddings_projected.npy --test_emb_npy results/curve_projector_ablation2/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector_ablation2/eval
+```
+
+## forecast mode: 滚动预测
+两周 -> 一周 滚动预测, 在2-10pipeline得到的WAPE:84.833%
+
+```bash
+python similarity_wape_pipeline.py  --train_csv outputs/train_item_embeddings.parquet  --test_csv outputs/test_item_embeddings.parquet  --train_emb_npy results/curve_projector_pca/projected/train_item_embeddings_projected.npy --test_emb_npy results/curve_projector_pca/projected/test_item_embeddings_projected.npy --top_k 20  --start_week 3  --forecast_mode rolling_2w1w --rolling_dyn_temp 1.0 --save_prefix results/curve_projector_pca/WAPE_results 
+
+
+```
+
+## curve projector 损失函数改动
+为了让curve projector在学习曲线相似度的同时贴近，把损失函数改为
+$ loss = MSE + \lambda * metric_loss $
+
+新增 / 相关参数	默认	含义
+--topk_loss_coef
+0
+关掉「与 similarity_wape 一致的 Top-K 加权曲线 MSE」；不设就和以前只训 Pearson metric 一样
+--lambda_metric
+1.0
+Pearson–cosine MSE 权重
+--top_k
+20
+仅在 topk_loss_coef > 0 时生效
+--pool_size
+512
+同上
+--topk_query_batch
+32
+同上
+--curve_loss_start_idx
+1
+Top-K 分支里曲线 MSE 的起始周（0-based）
+约束：topk_loss_coef 和 lambda_metric 不能同时为 0（否则会报错）。
+
+其余：--train_embeddings_npy、--train_curves_csv、--output_dir、--epochs、--pca_components 等与原来一致。
+
+## 改动后：带有PCA的projector
+WAPE:83.326%
+```bash
+
+# 这里的topk_loss_coef 设置这么大是因为想要两个loss物理尺度上对齐
+# coef为1时，两个loss尺度示例：epoch 1 mean loss: 0.173901  (metric: 0.346462, topk_wape_pipe: 0.000670) 
+
+python train_curve_projector.py  --train_embeddings_npy outputs/train_item_embeddings.npy  --train_curves_csv outputs/train_item_embeddings.parquet  --output_dir results/curve_projector_pca  --pca_components 32  --epochs 50 --topk_loss_coef 1000 --lambda_metric 0.5
+
+
+python apply_curve_projector.py  --projector_dir results/curve_projector_pca  --train_embeddings_npy outputs/train_item_embeddings.npy  --test_embeddings_npy outputs/test_item_embeddings.npy  --output_dir results/curve_projector_pca/projected  --device cuda
+
+# 对比学习+PCA
+python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.parquet --test_csv outputs/test_item_embeddings.parquet   --train_emb_npy results/curve_projector_pca/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector_pca/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector_pca/WAPE_results
+
 ```
