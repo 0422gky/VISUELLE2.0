@@ -1,50 +1,46 @@
 import os
 import argparse
-import wandb
 import torch
 import pandas as pd
 import pytorch_lightning as pl
 import inspect
+import numpy as np
 from pytorch_lightning import loggers as pl_loggers
 from pathlib import Path
 from datetime import datetime
-from models.GTM import GTM
-from models.FCN import FCN
 from utils.data_multitrends import ZeroShotDataset
+from utils.io_helpers import load_label_dicts, read_gtrends, read_split_csv, sample_train_df
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-def _torch_load_trusted(path: Path):
-    """
-    PyTorch 2.6+ 默认 torch.load(weights_only=True) 会拒绝加载包含 numpy/非纯权重对象的 .pt。
-    本项目的 category/color/fabric label 本质上是 dict/标签映射，通常你是信任该来源的。
-    """
-    try:
-        return torch.load(str(path), map_location="cpu", weights_only=False)
-    except TypeError:
-        # 兼容老版本 PyTorch（没有 weights_only 参数）
-        return torch.load(str(path), map_location="cpu")
+def _select_scale_slice(scale, start_idx: int, length: int) -> np.ndarray:
+    s = np.asarray(scale, dtype=np.float64).ravel()
+    if s.size == 1:
+        return s
+    if s.size >= start_idx + length:
+        return s[start_idx : start_idx + length]
+    if s.size >= length:
+        return s[:length]
+    return s
 
 
 def run(args):
+    import wandb
+
     print(args)
     # Seeds for reproducibility (By default we use the number 21)
     pl.seed_everything(args.seed)
 
     # Load sales data
-    train_df = pd.read_csv(Path(args.data_folder + 'train.csv'), parse_dates=['release_date'])
-    if args.train_frac < 1.0:
-        train_df = train_df.sample(frac=args.train_frac, random_state=args.seed).reset_index(drop=True)
-    test_df = pd.read_csv(Path(args.data_folder + 'test.csv'), parse_dates=['release_date'])
+    train_df = sample_train_df(read_split_csv(args.data_folder, "train"), args.train_frac, args.seed)
+    test_df = read_split_csv(args.data_folder, "test")
 
     # Load category and color encodings
-    cat_dict = _torch_load_trusted(Path(args.data_folder + 'category_labels.pt'))
-    col_dict = _torch_load_trusted(Path(args.data_folder + 'color_labels.pt'))
-    fab_dict = _torch_load_trusted(Path(args.data_folder + 'fabric_labels.pt'))
+    cat_dict, col_dict, fab_dict = load_label_dicts(args.data_folder)
 
     # Load Google trends
-    gtrends = pd.read_csv(Path(args.data_folder + 'gtrends.csv'), index_col=[0], parse_dates=True)
+    gtrends = read_gtrends(args.data_folder)
 
     lazy = bool(args.lazy_loader)
     train_loader = ZeroShotDataset(train_df, Path(args.data_folder + '/images'), gtrends, cat_dict, col_dict,
@@ -54,6 +50,8 @@ def run(args):
 
     # Create model
     if args.model_type == 'FCN':
+        from models.FCN import FCN
+
         model = FCN(
             embedding_dim=args.embedding_dim,
             hidden_dim=args.hidden_dim,
@@ -69,7 +67,33 @@ def run(args):
             use_encoder_mask=args.use_encoder_mask,
             gpu_num=args.gpu_num
         )
+    elif args.model_type == 'MMTS':
+        from models.MMTS import MMTS
+
+        rescale_values = _select_scale_slice(
+            np.load(Path(args.data_folder) / "normalization_scale.npy"),
+            2,
+            10,
+        )
+        model = MMTS(
+            embedding_dim=args.embedding_dim,
+            hidden_dim=args.hidden_dim,
+            output_dim=args.output_dim,
+            cat_dict=cat_dict,
+            col_dict=col_dict,
+            fab_dict=fab_dict,
+            use_text=args.use_text,
+            use_img=args.use_img,
+            gpu_num=args.gpu_num,
+            forecast_mode=args.forecast_mode,
+            contrastive_loss_weight=args.contrastive_loss_weight,
+            contrastive_temperature=args.contrastive_temperature,
+            num_attn_heads=args.num_attn_heads,
+            rescale_values=rescale_values.tolist(),
+        )
     else:
+        from models.GTM import GTM
+
         model = GTM(
             embedding_dim=args.embedding_dim,
             hidden_dim=args.hidden_dim,
@@ -156,7 +180,7 @@ if __name__ == '__main__':
     parser.add_argument('--gpu_num', type=int, default=0)
 
     # Model specific arguments
-    parser.add_argument('--model_type', type=str, default='GTM', help='Choose between GTM or FCN')
+    parser.add_argument('--model_type', type=str, default='GTM', help='Choose between GTM, FCN, or MMTS')
     parser.add_argument('--use_trends', type=int, default=1)
     parser.add_argument('--use_img', type=int, default=1)
     parser.add_argument('--use_text', type=int, default=1)
@@ -182,6 +206,25 @@ if __name__ == '__main__':
     parser.add_argument('--autoregressive', type=int, default=0)
     parser.add_argument('--num_attn_heads', type=int, default=4)
     parser.add_argument('--num_hidden_layers', type=int, default=1)
+    parser.add_argument(
+        '--forecast_mode',
+        type=str,
+        default='direct_2_10',
+        choices=['direct_2_10', 'rolling_2_1'],
+        help='MMTS only: direct 2-to-10 prediction or 2-week-to-1-week rolling prediction.',
+    )
+    parser.add_argument(
+        '--contrastive_loss_weight',
+        type=float,
+        default=0.1,
+        help='MMTS only: weight for InfoNCE TS-Img/TS-Text/TS-Temporal alignment loss.',
+    )
+    parser.add_argument(
+        '--contrastive_temperature',
+        type=float,
+        default=0.07,
+        help='MMTS only: temperature for InfoNCE logits.',
+    )
 
     # wandb arguments
     parser.add_argument('--wandb_entity', type=str, default='username-here')

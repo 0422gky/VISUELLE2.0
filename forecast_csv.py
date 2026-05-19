@@ -17,24 +17,12 @@ import pandas as pd
 import numpy as np
 import pytorch_lightning as pl
 from tqdm import tqdm
-from models.GTM import GTM
-from models.FCN import FCN
 from utils.data_multitrends import ZeroShotDataset
 from pathlib import Path
 from sklearn.metrics import mean_absolute_error
 
 from utils.curve_eval_metrics import avg_pearson_avg_dtw
-
-
-def _torch_load_trusted(path: Path):
-    """
-    PyTorch 2.6+ 默认 torch.load(weights_only=True) 会拒绝加载包含 numpy/非纯权重对象的 .pt。
-    本脚本用于加载 checkpoint/data dict，因此显式关闭 weights_only。
-    """
-    try:
-        return torch.load(str(path), map_location="cpu", weights_only=False)
-    except TypeError:
-        return torch.load(str(path), map_location="cpu")
+from utils.io_helpers import load_label_dicts, read_gtrends, read_split_csv, trusted_torch_load
 
 
 def compute_max_scaling_from_train_csv(train_csv: Path, num_week_cols: int = 12) -> float:
@@ -130,6 +118,17 @@ def _rescale_matrix_rows(mat: np.ndarray, scale) -> np.ndarray:
     return m * s_full
 
 
+def _select_scale_slice(scale, start_idx: int, length: int) -> np.ndarray:
+    s = np.asarray(scale, dtype=np.float64).ravel()
+    if s.size == 1:
+        return s
+    if s.size >= start_idx + length:
+        return s[start_idx : start_idx + length]
+    if s.size >= length:
+        return s[:length]
+    return s
+
+
 def write_forecast_csv(
     path: Path,
     external_codes: np.ndarray,
@@ -207,6 +206,7 @@ def write_forecast_csv(
 
 
 def run(args):
+
     print(args)
     
     # Set up CUDA
@@ -219,19 +219,17 @@ def run(args):
     read_csv_kw = {"parse_dates": ["release_date"]}
     if args.nrows is not None:
         read_csv_kw["nrows"] = args.nrows
-    test_df = pd.read_csv(Path(args.data_folder + "test.csv"), **read_csv_kw)
+    test_df = read_split_csv(args.data_folder, "test", **read_csv_kw)
     item_codes = test_df['external_code'].values
     if 'retail' not in test_df.columns:
         raise ValueError("test.csv 缺少列 `retail`，无法导出 forecast CSV（与 export_item_embeddings 元数据列一致）。")
     retail_vals = test_df['retail'].values
 
      # Load category and color encodings
-    cat_dict = _torch_load_trusted(Path(args.data_folder + 'category_labels.pt'))
-    col_dict = _torch_load_trusted(Path(args.data_folder + 'color_labels.pt'))
-    fab_dict = _torch_load_trusted(Path(args.data_folder + 'fabric_labels.pt'))
+    cat_dict, col_dict, fab_dict = load_label_dicts(args.data_folder)
 
     # Load Google trends
-    gtrends = pd.read_csv(Path(args.data_folder + 'gtrends.csv'), index_col=[0], parse_dates=True)
+    gtrends = read_gtrends(args.data_folder)
     
     test_loader = ZeroShotDataset(test_df, Path(args.data_folder + '/images'), gtrends, cat_dict, col_dict, \
             fab_dict, args.trend_len).get_loader(batch_size=1, train=False, lazy=bool(args.lazy_loader))
@@ -242,6 +240,8 @@ def run(args):
     # Create model
     model = None
     if args.model_type == 'FCN':
+        from models.FCN import FCN
+
         model = FCN(
             embedding_dim=args.embedding_dim,
             hidden_dim=args.hidden_dim,
@@ -257,7 +257,27 @@ def run(args):
             use_encoder_mask=args.use_encoder_mask,
             gpu_num=args.gpu_num
         )
+    elif args.model_type == 'MMTS':
+        from models.MMTS import MMTS
+
+        model = MMTS(
+            embedding_dim=args.embedding_dim,
+            hidden_dim=args.hidden_dim,
+            output_dim=args.output_dim,
+            cat_dict=cat_dict,
+            col_dict=col_dict,
+            fab_dict=fab_dict,
+            use_text=args.use_text,
+            use_img=args.use_img,
+            gpu_num=args.gpu_num,
+            forecast_mode=args.forecast_mode,
+            contrastive_loss_weight=args.contrastive_loss_weight,
+            contrastive_temperature=args.contrastive_temperature,
+            num_attn_heads=args.num_attn_heads,
+        )
     else:
+        from models.GTM import GTM
+
         model = GTM(
             embedding_dim=args.embedding_dim,
             hidden_dim=args.hidden_dim,
@@ -277,7 +297,7 @@ def run(args):
             use_hist_sales=args.use_hist_sales,
         )
     
-    ckpt = _torch_load_trusted(Path(args.ckpt_path))
+    ckpt = trusted_torch_load(Path(args.ckpt_path))
     model.load_state_dict(ckpt['state_dict'] if isinstance(ckpt, dict) and 'state_dict' in ckpt else ckpt, strict=False)
 
     # Forecast the testing set
@@ -291,6 +311,40 @@ def run(args):
             item_sales, recent_sales_2w, category, color, textures, temporal_features, gtrends, images = test_data
             if args.model_type == 'FCN':
                 y_pred = model(category, color, textures, temporal_features, gtrends, images)
+                is_flat = item_sales.detach().cpu().numpy().flatten()
+                y_flat = y_pred.detach().cpu().numpy().flatten()
+                if is_flat.size < 12:
+                    raise ValueError(
+                        f"item_sales 长度应为 12（与数据集一致），当前为 {is_flat.size}；请检查 test.csv 与 ZeroShotDataset。"
+                    )
+                forecasts.append(y_flat[: args.output_dim])
+                gt.append(is_flat[: args.output_dim])
+                gt12_norm.append(is_flat[:12].astype(np.float64, copy=False))
+                p12 = np.full(12, np.nan, dtype=np.float64)
+                p12[: args.output_dim] = y_flat[: args.output_dim]
+                pred12_norm.append(p12)
+            elif args.model_type == 'MMTS':
+                y_pred = model(
+                    category,
+                    color,
+                    textures,
+                    temporal_features,
+                    gtrends,
+                    images,
+                    recent_sales_2w=recent_sales_2w,
+                )
+                is_flat = item_sales.detach().cpu().numpy().flatten()
+                y_flat = y_pred.detach().cpu().numpy().flatten()
+                if is_flat.size < 12:
+                    raise ValueError(
+                        f"item_sales 长度应为 12（与数据集一致），当前为 {is_flat.size}；请检查 test.csv 与 ZeroShotDataset。"
+                    )
+                forecasts.append(y_flat[:10])
+                gt.append(is_flat[2:12])
+                gt12_norm.append(is_flat[:12].astype(np.float64, copy=False))
+                p12 = np.full(12, np.nan, dtype=np.float64)
+                p12[2:12] = y_flat[:10]
+                pred12_norm.append(p12)
             else:
                 y_pred = model(
                     category,
@@ -301,18 +355,18 @@ def run(args):
                     images,
                     recent_sales_2w=recent_sales_2w,
                 )
-            is_flat = item_sales.detach().cpu().numpy().flatten()
-            y_flat = y_pred.detach().cpu().numpy().flatten()
-            if is_flat.size < 12:
-                raise ValueError(
-                    f"item_sales 长度应为 12（与数据集一致），当前为 {is_flat.size}；请检查 test.csv 与 ZeroShotDataset。"
-                )
-            forecasts.append(y_flat[: args.output_dim])
-            gt.append(is_flat[: args.output_dim])
-            gt12_norm.append(is_flat[:12].astype(np.float64, copy=False))
-            p12 = np.full(12, np.nan, dtype=np.float64)
-            p12[: args.output_dim] = y_flat[: args.output_dim]
-            pred12_norm.append(p12)
+                is_flat = item_sales.detach().cpu().numpy().flatten()
+                y_flat = y_pred.detach().cpu().numpy().flatten()
+                if is_flat.size < 12:
+                    raise ValueError(
+                        f"item_sales 长度应为 12（与数据集一致），当前为 {is_flat.size}；请检查 test.csv 与 ZeroShotDataset。"
+                    )
+                forecasts.append(y_flat[: args.output_dim])
+                gt.append(is_flat[: args.output_dim])
+                gt12_norm.append(is_flat[:12].astype(np.float64, copy=False))
+                p12 = np.full(12, np.nan, dtype=np.float64)
+                p12[: args.output_dim] = y_flat[: args.output_dim]
+                pred12_norm.append(p12)
     forecasts = np.array(forecasts)
     gt = np.array(gt)
     gt12_norm = np.stack(gt12_norm, axis=0)
@@ -326,8 +380,9 @@ def run(args):
         train_csv_name=args.train_csv,
         num_week_cols=args.num_week_cols,
     )
-    rescaled_forecasts = forecasts * rescale_vals
-    rescaled_gt = gt * rescale_vals
+    eval_scale = _select_scale_slice(rescale_vals, 2, 10) if args.model_type == 'MMTS' else rescale_vals
+    rescaled_forecasts = _rescale_matrix_rows(forecasts, eval_scale)
+    rescaled_gt = _rescale_matrix_rows(gt, eval_scale)
     print_error_metrics(gt, forecasts, rescaled_gt, rescaled_forecasts)
 
     out_csv = Path(args.output_csv) if args.output_csv else Path('results') / f'{model_savename}_forecast.csv'
@@ -344,7 +399,7 @@ def run(args):
     )
 
     torch.save(
-        {'results': forecasts * rescale_vals, 'gts': gt * rescale_vals, 'codes': item_codes.tolist()},
+        {'results': rescaled_forecasts, 'gts': rescaled_gt, 'codes': item_codes.tolist()},
         Path('results/' + model_savename + '.pth'),
     )
 
@@ -365,7 +420,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=21)
 
     # Model specific arguments
-    parser.add_argument('--model_type', type=str, default='GTM', help='Choose between GTM or FCN')
+    parser.add_argument('--model_type', type=str, default='GTM', help='Choose between GTM, FCN, or MMTS')
     parser.add_argument('--use_trends', type=int, default=1)
     parser.add_argument('--use_img', type=int, default=1)
     parser.add_argument('--use_text', type=int, default=1)
@@ -384,6 +439,25 @@ if __name__ == '__main__':
     parser.add_argument('--autoregressive', type=int, default=0)
     parser.add_argument('--num_attn_heads', type=int, default=4)
     parser.add_argument('--num_hidden_layers', type=int, default=1)
+    parser.add_argument(
+        '--forecast_mode',
+        type=str,
+        default='direct_2_10',
+        choices=['direct_2_10', 'rolling_2_1'],
+        help='MMTS only: direct 2-to-10 prediction or 2-week-to-1-week rolling prediction.',
+    )
+    parser.add_argument(
+        '--contrastive_loss_weight',
+        type=float,
+        default=0.1,
+        help='MMTS only: weight for InfoNCE TS-Img/TS-Text/TS-Temporal alignment loss.',
+    )
+    parser.add_argument(
+        '--contrastive_temperature',
+        type=float,
+        default=0.07,
+        help='MMTS only: temperature for InfoNCE logits.',
+    )
     
     # wandb arguments
     parser.add_argument('--wandb_run', type=str, default='Run1')

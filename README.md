@@ -69,8 +69,7 @@ To evaluate the model of GTM-Transformer please use the following script .Please
 ```bash
 python forecast.py --data_folder dataset --ckpt_path ckpt/model.pth
 
-python forecast.py --data_folder "visuelle2/" --ckpt_path "log/GTM/GTM_Run1---epoch=29---25-03-2026-13-17-24.ckpt"
-
+python forecast.py --data_folder "visuelle2/" --ckpt_path "log/MMTS/MMTS_Run1---epoch=134---19-05-2026-20-27-42.ckpt"
 
 python forecast_csv.py --data_folder "visuelle2/" --ckpt_path "log/GTM/GTM_Run1---epoch=169---27-03-2026-11-28-07.ckpt" --output_dim 12 --gpu_num 0 --output_csv results/my_forecast.csv
 
@@ -262,4 +261,45 @@ python apply_curve_projector.py  --projector_dir results/curve_projector_pca  --
 # 对比学习+PCA
 python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.parquet --test_csv outputs/test_item_embeddings.parquet   --train_emb_npy results/curve_projector_pca/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector_pca/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector_pca/WAPE_results
 
+```
+
+
+## LGBM作为预测头的流程
+```bash
+/data/coding/gtm_venv/bin/python tmp_GTM_transformer/embeddings_lgbm_predict.py --train tmp_GTM_transformer/outputs/train_item_embeddings.parquet --test tmp_GTM_transformer/outputs/test_item_embeddings.parquet --train_nrows 96166 --test_nrows 10684  --forecast_mode rolling_2w1w --rolling_teacher_forcing
+=== LGBM Hparam Analysis ===
+n_estimators,learning_rate,mae,wape,best_iteration,samples
+96,0.08,0.036,73.811,84,20
+100,0.08,0.036,73.811,84,20
+128,0.08,0.036,73.811,84,20
+128,0.06,0.036,73.937,122,20
+64,0.1,0.036,74.079,52,20
+96,0.1,0.036,74.079,52,20
+100,0.1,0.036,74.079,52,20
+128,0.1,0.036,74.079,52,20
+50,0.1,0.036,74.208,49,20
+128,0.04,0.036,74.227,124,20
+96,0.06,0.036,74.481,88,20
+100,0.06,0.036,74.481,88,20
+96,0.04,0.036,74.559,95,20
+100,0.04,0.036,74.559,95,20
+64,0.08,0.036,74.564,64,20
+50,0.08,0.036,74.805,50,20
+64,0.06,0.036,74.866,64,20
+64,0.04,0.037,75.117,64,20
+50,0.06,0.037,75.138,49,20
+50,0.04,0.037,75.475,50,20
+
+```
+
+```bash
+/data/coding/gtm_venv/bin/python tmp_GTM_transformer/embeddings_lgbm_predict.py --train tmp_GTM_transformer/outputs/train_item_embeddings.parquet --test tmp_GTM_transformer/outputs/test_item_embeddings.parquet --train_nrows 96166 --test_nrows 10684 --analyze_hparams --n_estimators_grid 50,64,96,100,128 --learning_rate_grid 0.04,0.06,0.08,0.1 --analysis_output_csv tmp_GTM_transformer/results/emb_lgbm_hparam_analysis.csv --forecast_mode rolling_2w1w --rolling_teacher_forcing
+```
+
+## MMTS pipeline
+
+```bash
+python train.py --model_type MMTS --forecast_mode direct_2_10 --train_frac 0.01 --epochs 150 --data_folder "visuelle2/"
+
+python train.py --model_type MMTS --forecast_mode rolling_2_1 --train_frac 0.01 --epochs 150 --data_folder "visuelle2/"
 ```
