@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import os
 import sys
@@ -12,61 +14,48 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from models.GTM import GTM
 from utils.data_multitrends import (
     LazyZeroShotDataset,
     ZeroShotDataset,
     collate_lazy_zeroshot_batch,
 )
-
-
-def _torch_load_trusted(path: str):
-    """
-    PyTorch 2.6+ 默认 torch.load(weights_only=True) 会拒绝加载包含 numpy/非纯权重对象的 .pt。
-    本脚本加载的是数据字典/ckpt（你一般是信任来源的），因此显式 weights_only=False。
-    """
-    try:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        # 兼容老版本 PyTorch（没有 weights_only 参数）
-        return torch.load(path, map_location="cpu")
+from utils.io_helpers import (
+    extract_hparams,
+    load_label_dicts,
+    load_model_state_dict,
+    read_gtrends,
+    read_split_csv,
+    sample_train_df,
+    trusted_torch_load,
+)
 
 
 def _load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> None:
-    ckpt = _torch_load_trusted(checkpoint_path)
-    state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-    model.load_state_dict(state_dict, strict=False)
+    load_model_state_dict(model, checkpoint_path, strict=False)
 
 
 def _extract_hparams(ckpt: Dict) -> Dict:
-    if not isinstance(ckpt, dict):
-        return {}
-    if "hyper_parameters" in ckpt and isinstance(ckpt["hyper_parameters"], dict):
-        return ckpt["hyper_parameters"]
-    if "hparams" in ckpt and isinstance(ckpt["hparams"], dict):
-        return ckpt["hparams"]
-    return {}
+    return extract_hparams(ckpt)
 
 
 def _read_split_df(data_folder: str, split: str) -> pd.DataFrame:
-    csv_path = os.path.join(data_folder, f"{split}.csv")
-    # parse_dates 用于满足 ZeroShotDataset.preprocess_data() 里的时间运算
-    df = pd.read_csv(csv_path, parse_dates=["release_date"])
-    return df
-
-
-def sample_train_df(df: pd.DataFrame, train_frac: float, seed: int) -> pd.DataFrame:
-    """与 train.py 一致：仅对 train 子集抽样。"""
-    if not (0.0 < train_frac <= 1.0):
-        raise ValueError(f"train_frac must be in (0, 1], got {train_frac}")
-    if train_frac < 1.0:
-        return df.sample(frac=train_frac, random_state=seed).reset_index(drop=True)
-    return df.reset_index(drop=True)
+    return read_split_csv(data_folder, split)
 
 
 def _release_date_slash(val) -> str:
     ts = pd.to_datetime(val)
     return f"{int(ts.year)}/{int(ts.month)}/{int(ts.day)}"
+
+
+def _select_scale_slice(scale, start_idx: int, length: int) -> np.ndarray:
+    s = np.asarray(scale, dtype=np.float64).ravel()
+    if s.size == 1:
+        return s
+    if s.size >= start_idx + length:
+        return s[start_idx : start_idx + length]
+    if s.size >= length:
+        return s[:length]
+    return s
 
 
 def _build_compact_dataframe(
@@ -201,7 +190,7 @@ def export_for_df(
     split_name: str,
     df: pd.DataFrame,
     args: argparse.Namespace,
-    model: GTM,
+    model: torch.nn.Module,
 ) -> None:
     output_format = getattr(args, "output_format", "compact")
 
@@ -366,7 +355,7 @@ def export_for_df(
 def export_for_split(
     split_name: str,
     args: argparse.Namespace,
-    model: GTM,
+    model: torch.nn.Module,
 ) -> None:
     df = _read_split_df(args.data_folder, split_name)
     if split_name == "train":
@@ -380,6 +369,7 @@ def main():
     parser.add_argument("--data_folder", type=str, default="dataset/", help="dataset root folder")
     parser.add_argument("--output_dir", type=str, required=True, help="output directory")
     parser.add_argument("--split", type=str, default="all", choices=["train", "test", "all"])
+    parser.add_argument("--model_type", type=str, default="GTM", choices=["GTM", "MMTS"])
 
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -398,6 +388,25 @@ def main():
     parser.add_argument("--num_trends", type=int, default=3)
     parser.add_argument("--use_encoder_mask", type=int, default=1)
     parser.add_argument("--autoregressive", type=int, default=0)
+    parser.add_argument(
+        "--forecast_mode",
+        type=str,
+        default="direct_2_10",
+        choices=["direct_2_10", "rolling_2_1"],
+        help="MMTS only: direct 2-to-10 prediction or 2-week-to-1-week rolling prediction.",
+    )
+    parser.add_argument(
+        "--contrastive_loss_weight",
+        type=float,
+        default=0.1,
+        help="MMTS only: weight for InfoNCE TS-Img/TS-Text/TS-Temporal alignment loss.",
+    )
+    parser.add_argument(
+        "--contrastive_temperature",
+        type=float,
+        default=0.07,
+        help="MMTS only: temperature for InfoNCE logits.",
+    )
     parser.add_argument(
         "--use_hist_sales",
         type=int,
@@ -461,23 +470,17 @@ def main():
     args.device = torch.device(device_str)
 
     # load csv embeddings metadata (and dicts/models inputs)
-    cat_dict = _torch_load_trusted(os.path.join(args.data_folder, "category_labels.pt"))
-    col_dict = _torch_load_trusted(os.path.join(args.data_folder, "color_labels.pt"))
-    fab_dict = _torch_load_trusted(os.path.join(args.data_folder, "fabric_labels.pt"))
+    cat_dict, col_dict, fab_dict = load_label_dicts(args.data_folder)
 
     args.cat_dict = cat_dict
     args.col_dict = col_dict
     args.fab_dict = fab_dict
 
     # Load gtrends
-    args.gtrends = pd.read_csv(
-        os.path.join(args.data_folder, "gtrends.csv"),
-        index_col=[0],
-        parse_dates=True,
-    )
+    args.gtrends = read_gtrends(args.data_folder)
 
     # Load checkpoint + hyper parameters (if available)
-    ckpt = _torch_load_trusted(args.checkpoint)
+    ckpt = trusted_torch_load(args.checkpoint)
     hparams = _extract_hparams(ckpt)
 
     def get_h(k, default):
@@ -493,24 +496,58 @@ def main():
     if hparams.get("seed") is not None and int(hparams["seed"]) != int(args.seed):
         print(f"Note: checkpoint hyper_parameters seed={hparams['seed']} != CLI --seed={args.seed}")
 
-    model = GTM(
-        embedding_dim=get_h("embedding_dim", args.embedding_dim),
-        hidden_dim=get_h("hidden_dim", args.hidden_dim),
-        output_dim=get_h("output_dim", args.output_dim),
-        num_heads=get_h("num_heads", args.num_attn_heads),
-        num_layers=get_h("num_layers", args.num_hidden_layers),
-        use_text=get_h("use_text", args.use_text),
-        use_img=get_h("use_img", args.use_img),
-        cat_dict=cat_dict,
-        col_dict=col_dict,
-        fab_dict=fab_dict,
-        trend_len=get_h("trend_len", args.trend_len),
-        num_trends=get_h("num_trends", args.num_trends),
-        gpu_num=args.gpu_num,
-        use_encoder_mask=get_h("use_encoder_mask", args.use_encoder_mask),
-        autoregressive=get_h("autoregressive", args.autoregressive),
-        use_hist_sales=get_h("use_hist_sales", args.use_hist_sales),
-    )
+    if args.model_type == "MMTS":
+        from models.MMTS import MMTS
+
+        rescale_values = _select_scale_slice(
+            np.load(os.path.join(args.data_folder, "normalization_scale.npy")),
+            2,
+            10,
+        )
+        model = MMTS(
+            embedding_dim=get_h("embedding_dim", args.embedding_dim),
+            hidden_dim=get_h("hidden_dim", args.hidden_dim),
+            output_dim=get_h("output_dim", args.output_dim),
+            cat_dict=cat_dict,
+            col_dict=col_dict,
+            fab_dict=fab_dict,
+            use_text=get_h("use_text", args.use_text),
+            use_img=get_h("use_img", args.use_img),
+            gpu_num=args.gpu_num,
+            forecast_mode=get_h("forecast_mode", args.forecast_mode),
+            contrastive_loss_weight=get_h(
+                "contrastive_loss_weight",
+                args.contrastive_loss_weight,
+            ),
+            contrastive_temperature=get_h(
+                "contrastive_temperature",
+                args.contrastive_temperature,
+            ),
+            num_attn_heads=get_h("num_attn_heads", args.num_attn_heads),
+            rescale_values=rescale_values.tolist(),
+        )
+        print("Exporting MMTS fused embeddings. Note: MMTS accepts gtrends in forward but does not use them.")
+    else:
+        from models.GTM import GTM
+
+        model = GTM(
+            embedding_dim=get_h("embedding_dim", args.embedding_dim),
+            hidden_dim=get_h("hidden_dim", args.hidden_dim),
+            output_dim=get_h("output_dim", args.output_dim),
+            num_heads=get_h("num_heads", args.num_attn_heads),
+            num_layers=get_h("num_layers", args.num_hidden_layers),
+            use_text=get_h("use_text", args.use_text),
+            use_img=get_h("use_img", args.use_img),
+            cat_dict=cat_dict,
+            col_dict=col_dict,
+            fab_dict=fab_dict,
+            trend_len=get_h("trend_len", args.trend_len),
+            num_trends=get_h("num_trends", args.num_trends),
+            gpu_num=args.gpu_num,
+            use_encoder_mask=get_h("use_encoder_mask", args.use_encoder_mask),
+            autoregressive=get_h("autoregressive", args.autoregressive),
+            use_hist_sales=get_h("use_hist_sales", args.use_hist_sales),
+        )
     model.to(args.device)
     _load_checkpoint(model, args.checkpoint)
 

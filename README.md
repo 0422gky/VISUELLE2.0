@@ -302,4 +302,72 @@ n_estimators,learning_rate,mae,wape,best_iteration,samples
 python train.py --model_type MMTS --forecast_mode direct_2_10 --train_frac 0.01 --epochs 150 --data_folder "visuelle2/"
 
 python train.py --model_type MMTS --forecast_mode rolling_2_1 --train_frac 0.01 --epochs 150 --data_folder "visuelle2/"
+# 预测和训练， 2-1 和 2-10 命令， 完整训练时 train_frac 参数设置为1，小样本测试可用0.01
+python train.py \
+  --data_folder visuelle2/ \
+  --model_type MMTS \
+  --forecast_mode direct_2_10 \
+  --train_frac 1 \
+  --epochs 150 \
+  --batch_size 128 \
+  --embedding_dim 32 \
+  --hidden_dim 64 \
+  --num_attn_heads 4 \
+  --use_img 1 \
+  --use_text 1 \
+  --contrastive_loss_weight 0.1 \
+  --contrastive_temperature 0.07 \
+  --lazy_loader 1 \
+  --gpu_num 0 \
+  --seed 21 \
+  --log_dir log
+
+python train.py \
+  --data_folder visuelle2/ \
+  --model_type MMTS \
+  --forecast_mode rolling_2_1 \
+  --train_frac 1 \
+  --epochs 150 \
+  --batch_size 128 \
+  --embedding_dim 32 \
+  --hidden_dim 64 \
+  --num_attn_heads 4 \
+  --use_img 1 \
+  --use_text 1 \
+  --contrastive_loss_weight 0.1 \
+  --contrastive_temperature 0.07 \
+  --lazy_loader 1 \
+  --gpu_num 0 \
+  --seed 21 \
+  --log_dir log
+
+python forecast.py \
+  --model_type MMTS \
+  --forecast_mode direct_2_10 \
+  --ckpt_path log/MMTS/MMTS_Run1---epoch=134---19-05-2026-20-27-42.ckpt \
+  --data_folder dataset/visuelle2/ \
+  --gpu_num 0 \
+  --use_img 1 \
+  --use_text 1 \
+  --embedding_dim 32 \
+  --hidden_dim 64 \
+  --num_attn_heads 4
+
+# export MMTS embeddings
+python export_item_embeddings.py \
+  --model_type MMTS \
+  --checkpoint log/MMTS/MMTS_Run1---epoch=134---19-05-2026-20-27-42.ckpt \
+  --data_folder visuelle2/ \
+  --output_dir outputs/mmts_embeddings \
+  --split all \
+  --train_frac 1.0
+
+python embeddings_lgbm_predict.py \
+  --train outputs/mmts_embeddings/train_item_embeddings.parquet \
+  --test outputs/mmts_embeddings/test_item_embeddings.parquet \
+  --output_csv results/mmts_emb_lgbm_predictions.csv \
+  --start_week 2 \
+  --forecast_mode static \
+  --n_estimators 2000 \
+  --learning_rate 0.03
 ```
