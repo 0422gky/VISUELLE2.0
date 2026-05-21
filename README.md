@@ -362,6 +362,7 @@ python export_item_embeddings.py \
   --split all \
   --train_frac 1.0
 
+# predict using lgbm
 python embeddings_lgbm_predict.py \
   --train outputs/mmts_embeddings/train_item_embeddings.parquet \
   --test outputs/mmts_embeddings/test_item_embeddings.parquet \
@@ -370,4 +371,15 @@ python embeddings_lgbm_predict.py \
   --forecast_mode static \
   --n_estimators 2000 \
   --learning_rate 0.03
+
+# 使用加权平均预测和PCA,对比学习
+# 1) 在 GTM-Transformer 目录，用已导出的 train 向量训练（曲线与 npy 行对齐，如 train.csv 或带 sales_wk_* 的导出表）
+python train_curve_projector.py --train_embeddings_npy outputs/mmts_embeddings/train_item_embeddings.npy --train_curves_csv outputs/mmts_embeddings/train_item_embeddings.parquet --output_dir results/curve_projector_mmts --epochs 20 --pca_components 0 
+
+# 2) 生成投影后的 train/test npy
+python apply_curve_projector.py --projector_dir results/curve_projector_mmts --train_embeddings_npy outputs/mmts_embeddings/train_item_embeddings.npy  --test_embeddings_npy outputs/mmts_embeddings/test_item_embeddings.npy --output_dir results/curve_projector_mmts/projected
+
+# 3) WAPE（ GTM-Transformer 下用 run_similarity_wape_with_projected.py） 这个是使用了对比学习的metric 有对比学习，没有PCA
+python similarity_wape_pipeline.py --train_csv outputs/mmts_embeddings/train_item_embeddings.parquet --test_csv outputs/mmts_embeddings/test_item_embeddings.parquet   --train_emb_npy results/curve_projector_mmts/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector_mmts/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector_mmts/WAPE_results
+
 ```
