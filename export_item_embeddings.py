@@ -369,7 +369,7 @@ def main():
     parser.add_argument("--data_folder", type=str, default="dataset/", help="dataset root folder")
     parser.add_argument("--output_dir", type=str, required=True, help="output directory")
     parser.add_argument("--split", type=str, default="all", choices=["train", "test", "all"])
-    parser.add_argument("--model_type", type=str, default="GTM", choices=["GTM", "MMTS"])
+    parser.add_argument("--model_type", type=str, default="GTM", choices=["GTM", "MMTS", "StaticQKVGTM"])
 
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -399,13 +399,13 @@ def main():
         "--contrastive_loss_weight",
         type=float,
         default=0.1,
-        help="MMTS only: weight for InfoNCE TS-Img/TS-Text/TS-Temporal alignment loss.",
+        help="MMTS/StaticQKVGTM: weight for CLIP-style InfoNCE alignment loss.",
     )
     parser.add_argument(
         "--contrastive_temperature",
         type=float,
         default=0.07,
-        help="MMTS only: temperature for InfoNCE logits.",
+        help="MMTS/StaticQKVGTM: temperature for InfoNCE logits.",
     )
     parser.add_argument(
         "--use_hist_sales",
@@ -527,6 +527,32 @@ def main():
             rescale_values=rescale_values.tolist(),
         )
         print("Exporting MMTS fused embeddings. Note: MMTS accepts gtrends in forward but does not use them.")
+    elif args.model_type == "StaticQKVGTM":
+        from models.StaticQKVGTM import StaticQKVGTM
+
+        model = StaticQKVGTM(
+            embedding_dim=get_h("embedding_dim", args.embedding_dim),
+            hidden_dim=get_h("hidden_dim", args.hidden_dim),
+            output_dim=get_h("output_dim", args.output_dim),
+            num_heads=get_h("num_heads", args.num_attn_heads),
+            num_layers=get_h("num_layers", args.num_hidden_layers),
+            use_text=get_h("use_text", args.use_text),
+            use_img=get_h("use_img", args.use_img),
+            cat_dict=cat_dict,
+            col_dict=col_dict,
+            fab_dict=fab_dict,
+            gpu_num=args.gpu_num,
+            use_hist_sales=get_h("use_hist_sales", args.use_hist_sales),
+            contrastive_loss_weight=get_h(
+                "contrastive_loss_weight",
+                args.contrastive_loss_weight,
+            ),
+            contrastive_temperature=get_h(
+                "contrastive_temperature",
+                args.contrastive_temperature,
+            ),
+        )
+        print("Exporting StaticQKVGTM attention-token embeddings.")
     else:
         from models.GTM import GTM
 

@@ -126,6 +126,25 @@ def run(args):
             contrastive_temperature=args.contrastive_temperature,
             num_attn_heads=args.num_attn_heads,
         )
+    elif args.model_type == 'StaticQKVGTM':
+        from models.StaticQKVGTM import StaticQKVGTM
+
+        model = StaticQKVGTM(
+            embedding_dim=args.embedding_dim,
+            hidden_dim=args.hidden_dim,
+            output_dim=args.output_dim,
+            num_heads=args.num_attn_heads,
+            num_layers=args.num_hidden_layers,
+            cat_dict=cat_dict,
+            col_dict=col_dict,
+            fab_dict=fab_dict,
+            use_text=args.use_text,
+            use_img=args.use_img,
+            gpu_num=args.gpu_num,
+            use_hist_sales=args.use_hist_sales,
+            contrastive_loss_weight=args.contrastive_loss_weight,
+            contrastive_temperature=args.contrastive_temperature,
+        )
     else:
         from models.GTM import GTM
 
@@ -163,7 +182,7 @@ def run(args):
                 y_pred = model(category, color, textures, temporal_features, gtrends, images)
                 forecasts.append(y_pred.detach().cpu().numpy().flatten()[:args.output_dim])
                 gt.append(item_sales.detach().cpu().numpy().flatten()[:args.output_dim])
-            elif args.model_type == 'MMTS':
+            elif args.model_type in {'MMTS', 'StaticQKVGTM'}:
                 y_pred = model(
                     category,
                     color,
@@ -173,8 +192,9 @@ def run(args):
                     images,
                     recent_sales_2w=recent_sales_2w,
                 )
-                forecasts.append(y_pred.detach().cpu().numpy().flatten()[:10])
-                gt.append(item_sales.detach().cpu().numpy().flatten()[2:12])
+                tail_start = 12 - args.output_dim
+                forecasts.append(y_pred.detach().cpu().numpy().flatten()[: args.output_dim])
+                gt.append(item_sales.detach().cpu().numpy().flatten()[tail_start:12])
             else:
                 y_pred = model(
                     category,
@@ -192,8 +212,12 @@ def run(args):
 
     # 销量 Maximum scaling: normalized = raw / train_global_max；此处 × normalization_scale 即还原 raw。
     # 见论文仓库 issue: global max over training set.
-    rescale_vals = np.load(args.data_folder + 'normalization_scale.npy')
-    eval_scale = _select_scale_slice(rescale_vals, 2, 10) if args.model_type == 'MMTS' else rescale_vals
+    rescale_vals = np.load(Path(args.data_folder) / 'normalization_scale.npy')
+    eval_scale = (
+        _select_scale_slice(rescale_vals, 12 - args.output_dim, args.output_dim)
+        if args.model_type in {'MMTS', 'StaticQKVGTM'}
+        else rescale_vals
+    )
     rescaled_forecasts = _rescale_matrix_rows(forecasts, eval_scale)
     rescaled_gt = _rescale_matrix_rows(gt, eval_scale)
     print_error_metrics(gt, forecasts, rescaled_gt, rescaled_forecasts)
@@ -218,7 +242,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=21)
 
     # Model specific arguments
-    parser.add_argument('--model_type', type=str, default='GTM', help='Choose between GTM, FCN, or MMTS')
+    parser.add_argument('--model_type', type=str, default='GTM', help='Choose between GTM, FCN, MMTS, or StaticQKVGTM')
     parser.add_argument('--use_trends', type=int, default=1)
     parser.add_argument('--use_img', type=int, default=1)
     parser.add_argument('--use_text', type=int, default=1)
@@ -248,13 +272,13 @@ if __name__ == '__main__':
         '--contrastive_loss_weight',
         type=float,
         default=0.1,
-        help='MMTS only: weight for InfoNCE TS-Img/TS-Text/TS-Temporal alignment loss.',
+        help='MMTS/StaticQKVGTM: weight for CLIP-style InfoNCE alignment loss.',
     )
     parser.add_argument(
         '--contrastive_temperature',
         type=float,
         default=0.07,
-        help='MMTS only: temperature for InfoNCE logits.',
+        help='MMTS/StaticQKVGTM: temperature for InfoNCE logits.',
     )
     
     # wandb arguments

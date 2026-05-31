@@ -293,7 +293,34 @@ n_estimators,learning_rate,mae,wape,best_iteration,samples
 ```
 
 ```bash
-/data/coding/gtm_venv/bin/python tmp_GTM_transformer/embeddings_lgbm_predict.py --train tmp_GTM_transformer/outputs/train_item_embeddings.parquet --test tmp_GTM_transformer/outputs/test_item_embeddings.parquet --train_nrows 96166 --test_nrows 10684 --analyze_hparams --n_estimators_grid 50,64,96,100,128 --learning_rate_grid 0.04,0.06,0.08,0.1 --analysis_output_csv tmp_GTM_transformer/results/emb_lgbm_hparam_analysis.csv --forecast_mode rolling_2w1w --rolling_teacher_forcing
+/data/coding/gtm_venv/bin/python tmp_GTM_transformer/embeddings_lgbm_predict.py \
+  --train tmp_GTM_transformer/outputs/train_item_embeddings.parquet \
+  --test tmp_GTM_transformer/outputs/test_item_embeddings.parquet \
+  --train_nrows 96166 \
+  --test_nrows 10684 \
+  --analyze_hparams \
+  --n_estimators_grid 256 \
+  --learning_rate_grid 0.02,0.04,0.06 \
+  --num_leaves_grid 31 \
+  --min_child_samples_grid 10 \
+  --subsample_grid 0.8 \
+  --colsample_bytree_grid 0.8 \
+  --reg_lambda_grid 1.0 \
+  --analysis_output_csv tmp_GTM_transformer/results/emb_lgbm_hparam_analysis_stage1.csv \
+  --forecast_mode rolling_2w1w \
+  --rolling_teacher_forcing \
+  --device_type cuda \
+  --max_bin 63
+
+python GTM/GTM-Transformer/embeddings_lgbm_predict.py `
+  --analyze_hparams 
+  --n_estimators_grid "50,64,96,100,128,500" 
+  --learning_rate_grid "0.01,0.03,0.05,0.07,0.09,0.1" `
+  --num_leaves_grid "31,63,127" `
+  --min_child_samples_grid "1,3,5,10,30,60" `
+  --subsample_grid "0.8,1.0" `
+  --colsample_bytree_grid "0.8,1.0" `
+  --reg_lambda_grid "0.1,1.0,5.0"
 ```
 
 ## MMTS pipeline
@@ -368,9 +395,11 @@ python embeddings_lgbm_predict.py \
   --test outputs/mmts_embeddings/test_item_embeddings.parquet \
   --output_csv results/mmts_emb_lgbm_predictions.csv \
   --start_week 2 \
-  --forecast_mode static \
-  --n_estimators 2000 \
-  --learning_rate 0.03
+  --forecast_mode rolling_2w1w \
+  --n_estimators 256 \
+  --learning_rate 0.04 \
+  --eval_ref_stats \
+  --ref_top_k 20
 
 # 使用加权平均预测和PCA,对比学习
 # 1) 在 GTM-Transformer 目录，用已导出的 train 向量训练（曲线与 npy 行对齐，如 train.csv 或带 sales_wk_* 的导出表）
@@ -380,6 +409,63 @@ python train_curve_projector.py --train_embeddings_npy outputs/mmts_embeddings/t
 python apply_curve_projector.py --projector_dir results/curve_projector_mmts --train_embeddings_npy outputs/mmts_embeddings/train_item_embeddings.npy  --test_embeddings_npy outputs/mmts_embeddings/test_item_embeddings.npy --output_dir results/curve_projector_mmts/projected
 
 # 3) WAPE（ GTM-Transformer 下用 run_similarity_wape_with_projected.py） 这个是使用了对比学习的metric 有对比学习，没有PCA
-python similarity_wape_pipeline.py --train_csv outputs/mmts_embeddings/train_item_embeddings.parquet --test_csv outputs/mmts_embeddings/test_item_embeddings.parquet   --train_emb_npy results/curve_projector_mmts/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector_mmts/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector_mmts/WAPE_results
+python similarity_wape_pipeline.py \
+  --train_csv outputs/mmts_embeddings/train_item_embeddings.parquet \
+  --test_csv outputs/mmts_embeddings/test_item_embeddings.parquet \
+  --train_emb_npy results/curve_projector_mmts/projected/train_item_embeddings_projected.npy \
+  --test_emb_npy results/curve_projector_mmts/projected/test_item_embeddings_projected.npy \
+  --save_prefix results/curve_projector_mmts/WAPE_results \
+  --hit_ratio 0.1
 
+# 2w1w
+python similarity_wape_pipeline.py \
+  --train_csv outputs/mmts_embeddings/train_item_embeddings.parquet \
+  --test_csv outputs/mmts_embeddings/test_item_embeddings.parquet \
+  --train_emb_npy results/curve_projector_mmts/projected/train_item_embeddings_projected.npy \
+  --test_emb_npy results/curve_projector_mmts/projected/test_item_embeddings_projected.npy \
+  --forecast_mode rolling_2w1w \
+  --top_k 20 \
+  --start_week 2 \
+  --hit_ratio 0.1 \
+  --save_prefix results/curve_projector_mmts/WAPE_results_2w1w
+
+```
+
+## StaticQKVGTM pipeline
+
+`StaticQKVGTM` is a GTM-style experimental model. It first builds `static_feature_fusion` from image, text, temporal features, and optional 2-week sales. Unlike GTM, its horizon-level `Q/K/V` tokens are all generated from that static fusion vector, so Google Trends is not used as decoder key/value memory. Training also adds a CLIP-style InfoNCE term to align fused semantics with image/text semantics.
+
+```bash
+python train.py \
+  --data_folder visuelle2/ \
+  --model_type StaticQKVGTM \
+  --train_frac 1 \
+  --epochs 150 \
+  --batch_size 128 \
+  --embedding_dim 32 \
+  --hidden_dim 64 \
+  --output_dim 10 \
+  --num_attn_heads 4 \
+  --num_hidden_layers 1 \
+  --use_img 1 \
+  --use_text 1 \
+  --use_hist_sales 1 \
+  --contrastive_loss_weight 0.1 \
+  --contrastive_temperature 0.07 \
+  --lazy_loader 1 \
+  --gpu_num 0 \
+  --wandb_run StaticQKV_Run1
+```
+
+Export embeddings from a trained `StaticQKVGTM` checkpoint:
+
+```bash
+python export_item_embeddings.py \
+  --model_type StaticQKVGTM \
+  --checkpoint log/StaticQKVGTM/path-to-best.ckpt \
+  --data_folder dataset/visuelle2/ \
+  --split all \
+  --output_dir outputs/static_qkv_embeddings \
+  --use_hist_sales 1 \
+  --output_dim 10
 ```

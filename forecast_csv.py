@@ -275,6 +275,25 @@ def run(args):
             contrastive_temperature=args.contrastive_temperature,
             num_attn_heads=args.num_attn_heads,
         )
+    elif args.model_type == 'StaticQKVGTM':
+        from models.StaticQKVGTM import StaticQKVGTM
+
+        model = StaticQKVGTM(
+            embedding_dim=args.embedding_dim,
+            hidden_dim=args.hidden_dim,
+            output_dim=args.output_dim,
+            num_heads=args.num_attn_heads,
+            num_layers=args.num_hidden_layers,
+            cat_dict=cat_dict,
+            col_dict=col_dict,
+            fab_dict=fab_dict,
+            use_text=args.use_text,
+            use_img=args.use_img,
+            gpu_num=args.gpu_num,
+            use_hist_sales=args.use_hist_sales,
+            contrastive_loss_weight=args.contrastive_loss_weight,
+            contrastive_temperature=args.contrastive_temperature,
+        )
     else:
         from models.GTM import GTM
 
@@ -323,7 +342,7 @@ def run(args):
                 p12 = np.full(12, np.nan, dtype=np.float64)
                 p12[: args.output_dim] = y_flat[: args.output_dim]
                 pred12_norm.append(p12)
-            elif args.model_type == 'MMTS':
+            elif args.model_type in {'MMTS', 'StaticQKVGTM'}:
                 y_pred = model(
                     category,
                     color,
@@ -339,11 +358,12 @@ def run(args):
                     raise ValueError(
                         f"item_sales 长度应为 12（与数据集一致），当前为 {is_flat.size}；请检查 test.csv 与 ZeroShotDataset。"
                     )
-                forecasts.append(y_flat[:10])
-                gt.append(is_flat[2:12])
+                tail_start = 12 - args.output_dim
+                forecasts.append(y_flat[: args.output_dim])
+                gt.append(is_flat[tail_start:12])
                 gt12_norm.append(is_flat[:12].astype(np.float64, copy=False))
                 p12 = np.full(12, np.nan, dtype=np.float64)
-                p12[2:12] = y_flat[:10]
+                p12[tail_start:12] = y_flat[: args.output_dim]
                 pred12_norm.append(p12)
             else:
                 y_pred = model(
@@ -380,7 +400,11 @@ def run(args):
         train_csv_name=args.train_csv,
         num_week_cols=args.num_week_cols,
     )
-    eval_scale = _select_scale_slice(rescale_vals, 2, 10) if args.model_type == 'MMTS' else rescale_vals
+    eval_scale = (
+        _select_scale_slice(rescale_vals, 12 - args.output_dim, args.output_dim)
+        if args.model_type in {'MMTS', 'StaticQKVGTM'}
+        else rescale_vals
+    )
     rescaled_forecasts = _rescale_matrix_rows(forecasts, eval_scale)
     rescaled_gt = _rescale_matrix_rows(gt, eval_scale)
     print_error_metrics(gt, forecasts, rescaled_gt, rescaled_forecasts)
@@ -420,7 +444,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=21)
 
     # Model specific arguments
-    parser.add_argument('--model_type', type=str, default='GTM', help='Choose between GTM, FCN, or MMTS')
+    parser.add_argument('--model_type', type=str, default='GTM', help='Choose between GTM, FCN, MMTS, or StaticQKVGTM')
     parser.add_argument('--use_trends', type=int, default=1)
     parser.add_argument('--use_img', type=int, default=1)
     parser.add_argument('--use_text', type=int, default=1)
@@ -450,13 +474,13 @@ if __name__ == '__main__':
         '--contrastive_loss_weight',
         type=float,
         default=0.1,
-        help='MMTS only: weight for InfoNCE TS-Img/TS-Text/TS-Temporal alignment loss.',
+        help='MMTS/StaticQKVGTM: weight for CLIP-style InfoNCE alignment loss.',
     )
     parser.add_argument(
         '--contrastive_temperature',
         type=float,
         default=0.07,
-        help='MMTS only: temperature for InfoNCE logits.',
+        help='MMTS/StaticQKVGTM: temperature for InfoNCE logits.',
     )
     
     # wandb arguments

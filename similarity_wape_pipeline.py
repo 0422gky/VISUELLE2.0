@@ -284,6 +284,57 @@ def curve_shape_metrics_from_forecast_df(
     return avg_pearson_avg_dtw(gt, pred, wsl=start_idx, tw=None)
 
 
+def add_sum_columns_to_forecast(forecast_df: pd.DataFrame, start_week: int) -> pd.DataFrame:
+    """
+    为爆款捕捉率计算增加评估窗口内的真实/预测总销量列。
+
+    列名对齐 embeddings_lgbm_predict.py:
+    - Actual_sum_i
+    - Pred_sum_i
+    """
+    if start_week < 1:
+        raise ValueError(f"start_week 必须 >= 1，当前 {start_week}")
+    start_idx = start_week - 1
+    out = forecast_df.copy()
+    out["Actual_sum_i"] = out["true_curve"].apply(
+        lambda curve: float(np.sum(np.asarray(curve, dtype=np.float64)[start_idx:]))
+    )
+    out["Pred_sum_i"] = out["pred_curve"].apply(
+        lambda curve: float(np.sum(np.asarray(curve, dtype=np.float64)[start_idx:]))
+    )
+    return out
+
+
+def compute_hit_capture_rate(
+    results_df: pd.DataFrame,
+    hit_ratio: float = 0.1,
+    actual_col: str = "Actual_sum_i",
+    pred_col: str = "Pred_sum_i",
+) -> Tuple[float, int, int]:
+    """
+    计算爆款捕捉率，逻辑对齐 embeddings_lgbm_predict.py。
+
+    规则:
+    - 按真实销量总和与预测销量总和分别取前 top_k 个样本
+    - top_k = max(1, ceil(n_valid * hit_ratio))
+    - 爆款捕捉率 = 两个 top_k 集合的交集 / top_k
+    """
+    if results_df.empty:
+        return 0.0, 0, 0
+    if not (0.0 < hit_ratio <= 1.0):
+        raise ValueError(f"hit_ratio must be in (0, 1], got {hit_ratio}")
+    miss = {actual_col, pred_col} - set(results_df.columns)
+    if miss:
+        raise ValueError(f"results_df 缺少列: {sorted(miss)}")
+
+    n_valid = len(results_df)
+    top_k = max(1, int(np.ceil(n_valid * hit_ratio)))
+    actual_top = set(results_df.nlargest(top_k, actual_col).index)
+    pred_top = set(results_df.nlargest(top_k, pred_col).index)
+    hit_capture_rate = len(actual_top & pred_top) / top_k
+    return float(hit_capture_rate), top_k, n_valid
+
+
 def run_similarity_wape(
     test_df: pd.DataFrame,
     train_df: pd.DataFrame,
@@ -560,6 +611,12 @@ if __name__ == "__main__":
         help="输出对比的 Top-K 列表，逗号分隔，例如: 1,5,20",
     )
     parser.add_argument(
+        "--hit_ratio",
+        type=float,
+        default=0.1,
+        help="爆款捕捉率的 top 比例，默认 0.1 表示前 10%%",
+    )
+    parser.add_argument(
         "--forecast_mode",
         type=str,
         default="static",
@@ -651,6 +708,32 @@ if __name__ == "__main__":
         rolling_teacher_forcing=args.rolling_teacher_forcing,
         rolling_dyn_temp=args.rolling_dyn_temp,
     )
+    forecast_df = add_sum_columns_to_forecast(forecast_df, start_week=args.start_week)
+
+    hit_source_df = forecast_df
+    hit_test_df_for_capture = None
+    if args.test_nrows is not None:
+        hit_test_df_for_capture = prepare_input_from_file(args.test_csv, nrows=None)
+        if args.test_emb_npy:
+            hit_test_df_for_capture = attach_embeddings_from_npy(
+                hit_test_df_for_capture,
+                args.test_emb_npy,
+            )
+        _, hit_forecast_df, _, _, _, _, _, _ = run_similarity_wape(
+            test_df=hit_test_df_for_capture,
+            train_df=train_df,
+            top_k=args.top_k,
+            start_week=args.start_week,
+            forecast_mode=args.forecast_mode,
+            rolling_teacher_forcing=args.rolling_teacher_forcing,
+            rolling_dyn_temp=args.rolling_dyn_temp,
+        )
+        hit_source_df = add_sum_columns_to_forecast(hit_forecast_df, start_week=args.start_week)
+
+    hit_capture_rate, hit_top_k, hit_n_valid = compute_hit_capture_rate(
+        results_df=hit_source_df,
+        hit_ratio=args.hit_ratio,
+    )
 
     print("=== Similarity Forecast Metrics ===")
     print(f"Samples: {len(forecast_df)}")
@@ -665,6 +748,10 @@ if __name__ == "__main__":
     print(f"Global WAPE (W{args.start_week}-W12): {wape}%")
     print(f"Avg_Pearson (W{args.start_week}-W12): {avg_pearson:.4f}")
     print(f"Avg_DTW (W{args.start_week}-W12): {avg_dtw:.4f}")
+    print(
+        f"Hit Capture Rate (top {args.hit_ratio:.0%}, W{args.start_week}-W12): "
+        f"{hit_capture_rate:.4f} (top_k={hit_top_k}, n_valid={hit_n_valid})"
+    )
 
     if ref_group_summary_stats is not None:
         print("\n=== Neighbor ref-curve group stats (per test_code×test_retail, W{}+) ===".format(args.start_week))
@@ -685,10 +772,31 @@ if __name__ == "__main__":
                 rolling_teacher_forcing=args.rolling_teacher_forcing,
                 rolling_dyn_temp=args.rolling_dyn_temp,
             )
+            fc_k = add_sum_columns_to_forecast(fc_k, start_week=args.start_week)
+            hit_eval_df_k = fc_k
+            if hit_test_df_for_capture is not None:
+                _, hit_fc_k, _, _, _, _, _, _ = run_similarity_wape(
+                    test_df=hit_test_df_for_capture,
+                    train_df=train_df,
+                    top_k=k,
+                    start_week=args.start_week,
+                    forecast_mode=args.forecast_mode,
+                    rolling_teacher_forcing=args.rolling_teacher_forcing,
+                    rolling_dyn_temp=args.rolling_dyn_temp,
+                )
+                hit_eval_df_k = add_sum_columns_to_forecast(
+                    hit_fc_k,
+                    start_week=args.start_week,
+                )
+            hit_k, hit_top_k_k, hit_n_valid_k = compute_hit_capture_rate(
+                hit_eval_df_k,
+                hit_ratio=args.hit_ratio,
+            )
             print(
                 f"Top{k:<2} -> Samples: {len(fc_k):>3}, "
                 f"MAE: {mae_k:.3f}, WAPE: {wape_k:.3f}%, "
-                f"Avg_P: {ap_k:.4f}, Avg_DTW: {dtw_k:.4f}"
+                f"Avg_P: {ap_k:.4f}, Avg_DTW: {dtw_k:.4f}, "
+                f"Hit: {hit_k:.4f} (top_k={hit_top_k_k}, n={hit_n_valid_k})"
             )
 
     if args.save_prefix:
