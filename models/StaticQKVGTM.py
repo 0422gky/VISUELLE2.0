@@ -180,6 +180,9 @@ class StaticQKVGTM(pl.LightningModule):
         return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
 
     def _clip_semantic_loss(self, static_feature, pooled_img, text_encoding):
+        if self.contrastive_loss_weight <= 0:
+            return torch.tensor(0.0, device=static_feature.device, dtype=static_feature.dtype)
+
         fused_z = self.fused_semantic(static_feature)
         losses = []
         if self.use_img == 1:

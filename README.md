@@ -455,6 +455,8 @@ python train.py \
   --lazy_loader 1 \
   --gpu_num 0 \
   --wandb_run StaticQKV_Run1
+
+# 想要在这里关闭StaticQKVGTM 的CLIP 对比学习，设置 contrastive_loss_weight = 0即可
 ```
 
 Export embeddings from a trained `StaticQKVGTM` checkpoint:
