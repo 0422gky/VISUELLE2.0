@@ -110,6 +110,18 @@ def run(args):
             contrastive_loss_weight=args.contrastive_loss_weight,
             contrastive_temperature=args.contrastive_temperature,
         )
+    elif args.model_type == 'Simple':
+        from models.Simple import Simple
+
+        model = Simple(
+            embedding_dim=args.embedding_dim,
+            hidden_dim=args.hidden_dim,
+            output_dim=args.output_dim,
+            cat_dict=cat_dict,
+            col_dict=col_dict,
+            fab_dict=fab_dict,
+            gpu_num=args.gpu_num,
+        )
     else:
         from models.GTM import GTM
 
@@ -186,7 +198,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Zero-shot sales forecasting')
 
     # General arguments
-    parser.add_argument('--data_folder', type=str, default='dataset/')
+    parser.add_argument('--data_folder', type=str, default='visuelle2/')
     parser.add_argument(
         '--lazy_loader',
         type=int,
@@ -199,7 +211,7 @@ if __name__ == '__main__':
     parser.add_argument('--gpu_num', type=int, default=0)
 
     # Model specific arguments
-    parser.add_argument('--model_type', type=str, default='GTM', help='Choose between GTM, FCN, MMTS, or StaticQKVGTM')
+    parser.add_argument('--model_type', type=str, default='GTM', help='Choose between GTM, FCN, MMTS, StaticQKVGTM, or Simple')
     parser.add_argument('--use_trends', type=int, default=1)
     parser.add_argument('--use_img', type=int, default=1)
     parser.add_argument('--use_text', type=int, default=1)

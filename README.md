@@ -459,6 +459,29 @@ python train.py \
 # 想要在这里关闭StaticQKVGTM 的CLIP 对比学习，设置 contrastive_loss_weight = 0即可
 ```
 
+```bash
+# 关闭了CLIP的StaticQKVGTM
+python train.py \
+  --data_folder visuelle2/ \
+  --model_type StaticQKVGTM \
+  --train_frac 1 \
+  --epochs 150 \
+  --batch_size 128 \
+  --embedding_dim 32 \
+  --hidden_dim 64 \
+  --output_dim 10 \
+  --num_attn_heads 4 \
+  --num_hidden_layers 1 \
+  --use_img 1 \
+  --use_text 1 \
+  --use_hist_sales 1 \
+  --contrastive_loss_weight 0 \
+  --contrastive_temperature 0 \
+  --lazy_loader 1 \
+  --gpu_num 0 \
+  --log_dir 'log/noCLIP'
+```
+
 Export embeddings from a trained `StaticQKVGTM` checkpoint:
 
 ```bash
@@ -469,5 +492,21 @@ python export_item_embeddings.py \
   --split all \
   --output_dir outputs/static_qkv_embeddings \
   --use_hist_sales 1 \
+  --output_dim 10
+```
+
+## Simple Network
+```bash
+python train.py --model_type Simple --embedding_dim 32 --hidden_dim 64 --output_dim 12
+```
+
+### export Simple Network embedding
+```bash
+python export_item_embeddings.py \
+  --model_type Simple \
+  --checkpoint log/Simple/path-to-best.ckpt \
+  --data_folder dataset/visuelle2/ \
+  --split all \
+  --output_dir outputs/simple_embeddings \
   --output_dim 10
 ```

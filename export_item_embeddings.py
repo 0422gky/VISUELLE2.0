@@ -369,7 +369,7 @@ def main():
     parser.add_argument("--data_folder", type=str, default="dataset/", help="dataset root folder")
     parser.add_argument("--output_dir", type=str, required=True, help="output directory")
     parser.add_argument("--split", type=str, default="all", choices=["train", "test", "all"])
-    parser.add_argument("--model_type", type=str, default="GTM", choices=["GTM", "MMTS", "StaticQKVGTM"])
+    parser.add_argument("--model_type", type=str, default="GTM", choices=["GTM", "MMTS", "StaticQKVGTM", "Simple"])
 
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -553,6 +553,19 @@ def main():
             ),
         )
         print("Exporting StaticQKVGTM attention-token embeddings.")
+    elif args.model_type == "Simple":
+        from models.Simple import Simple
+
+        model = Simple(
+            embedding_dim=get_h("embedding_dim", args.embedding_dim),
+            hidden_dim=get_h("hidden_dim", args.hidden_dim),
+            output_dim=get_h("output_dim", args.output_dim),
+            cat_dict=cat_dict,
+            col_dict=col_dict,
+            fab_dict=fab_dict,
+            gpu_num=args.gpu_num,
+        )
+        print("Exporting Simple hidden-layer embeddings.")
     else:
         from models.GTM import GTM
 
