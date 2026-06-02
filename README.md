@@ -487,10 +487,10 @@ Export embeddings from a trained `StaticQKVGTM` checkpoint:
 ```bash
 python export_item_embeddings.py \
   --model_type StaticQKVGTM \
-  --checkpoint log/StaticQKVGTM/path-to-best.ckpt \
-  --data_folder dataset/visuelle2/ \
+  --checkpoint log/noCLIP/StaticQKVGTM/StaticQKVGTM_Run1---epoch=4---01-06-2026-12-27-09.ckpt \
+  --data_folder visuelle2/ \
   --split all \
-  --output_dir outputs/static_qkv_embeddings \
+  --output_dir outputs/static_qkv_noclip_embeddings \
   --use_hist_sales 1 \
   --output_dim 10
 ```
@@ -504,8 +504,8 @@ python train.py --model_type Simple --embedding_dim 32 --hidden_dim 64 --output_
 ```bash
 python export_item_embeddings.py \
   --model_type Simple \
-  --checkpoint log/Simple/path-to-best.ckpt \
-  --data_folder dataset/visuelle2/ \
+  --checkpoint log/Simple/Simple_Run1---epoch=24---01-06-2026-23-27-54.ckpt \
+  --data_folder visuelle2/ \
   --split all \
   --output_dir outputs/simple_embeddings \
   --output_dim 10
