@@ -510,3 +510,49 @@ python export_item_embeddings.py \
   --output_dir outputs/simple_embeddings \
   --output_dim 10
 ```
+
+### Inference using Simple Network
+```text
+train -> apply (projector) -> similarity wape pipeline
+```
+
+```bash
+python train_curve_projector.py  --train_embeddings_npy outputs/train_item_embeddings.npy  --train_curves_csv outputs/train_item_embeddings.parquet  --output_dir results/curve_projector_pca  --pca_components 32  --epochs 50 --topk_loss_coef 1000 --lambda_metric 0.5
+
+
+python apply_curve_projector.py  --projector_dir results/curve_projector_pca  --train_embeddings_npy outputs/train_item_embeddings.npy  --test_embeddings_npy outputs/test_item_embeddings.npy  --output_dir results/curve_projector_pca/projected  --device cuda
+
+# 对比学习+PCA
+python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.parquet --test_csv outputs/test_item_embeddings.parquet   --train_emb_npy results/curve_projector_pca/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector_pca/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector_pca/WAPE_results
+```
+
+### Inference without using the Metric Learning method
+```bash
+python similarity_wape_pipeline.py --train_csv outputs/simple_embeddings/train_item_embeddings.parquet --test_csv outputs/simple_embeddings/test_item_embeddings.parquet   --train_emb_npy outputs/simple_embeddings/train_item_embeddings.npy   --test_emb_npy outputs/simple_embeddings/test_item_embeddings.npy --save_prefix results/Simple/NO_METRIC/WAPE_results
+
+# 2w1w
+python similarity_wape_pipeline.py \
+  --train_csv outputs/simple_embeddings/train_item_embeddings.parquet \
+  --test_csv outputs/simple_embeddings/test_item_embeddings.parquet \
+  --train_emb_npy outputs/simple_embeddings/train_item_embeddings.npy \
+  --test_emb_npy outputs/simple_embeddings/test_item_embeddings.npy \
+  --forecast_mode rolling_2w1w \
+  --top_k 20 \
+  --start_week 2 \
+  --hit_ratio 0.1 \
+  --save_prefix results/Simple/NO_METRIC/WAPE_results_2w1w
+```
+
+
+### Inference with the Metric Learning method(with PCA)
+```bash
+# 关闭PCA只要关闭 pca_components 即可
+
+python train_curve_projector.py  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy  --train_curves_csv outputs/simple_embeddings/train_item_embeddings.parquet  --output_dir results/Simple_PCA  --pca_components 32  --epochs 50 --topk_loss_coef 1000 --lambda_metric 0.5
+
+
+python apply_curve_projector.py  --projector_dir results/curve_projector_pca  --train_embeddings_npy outputs/train_item_embeddings.npy  --test_embeddings_npy outputs/test_item_embeddings.npy  --output_dir results/curve_projector_pca/projected  --device cuda
+
+# 对比学习+PCA
+python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.parquet --test_csv outputs/test_item_embeddings.parquet   --train_emb_npy results/curve_projector_pca/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector_pca/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector_pca/WAPE_results
+```
