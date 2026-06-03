@@ -48,9 +48,14 @@ def build_similarity_refs(
     top_k: int = 20,
     embedding_col: str = "embedding",
     curve_col: str = "curve",
+    release_date_col: str = "release_date",
+    min_ref_history_weeks: int = 0,
 ) -> pd.DataFrame:
     """
     计算 test->train 的 Top-K 相似邻居，并返回明细表 final_ref_df。
+
+    当 min_ref_history_weeks > 0 时，每个 test 样本只允许使用满足
+    train_release_date + min_ref_history_weeks 周 <= test_release_date 的 train 邻居。
 
     返回列包含:
     [external_code, retail, curve, sim_score, test_code, test_retail, test_curve]
@@ -62,17 +67,52 @@ def build_similarity_refs(
         raise ValueError(f"train_df 缺少列: {sorted(miss_train)}")
     if miss_test:
         raise ValueError(f"test_df 缺少列: {sorted(miss_test)}")
+    if min_ref_history_weeks < 0:
+        raise ValueError(f"min_ref_history_weeks 必须 >= 0，当前 {min_ref_history_weeks}")
+    use_temporal_cutoff = min_ref_history_weeks > 0
+    if use_temporal_cutoff:
+        miss_date = {
+            name
+            for name, df in [("train_df", train_df), ("test_df", test_df)]
+            if release_date_col not in df.columns
+        }
+        if miss_date:
+            raise ValueError(
+                f"{sorted(miss_date)} 缺少列 `{release_date_col}`，"
+                "无法应用 train_release_date + N周 <= test_release_date 约束。"
+            )
 
     test_emb = _to_2d_array(test_df[embedding_col], embedding_col)
     train_emb = _to_2d_array(train_df[embedding_col], embedding_col)
     sim_matrix = cosine_similarity(test_emb, train_emb)
 
     k = min(top_k, len(train_df))
-    top_indices = np.argsort(sim_matrix, axis=1)[:, :-k - 1 : -1]
+    if k <= 0:
+        raise ValueError("train_df 为空，无法检索相似邻居。")
+    sorted_indices = np.argsort(sim_matrix, axis=1)[:, ::-1]
+    if use_temporal_cutoff:
+        train_release_dates = pd.to_datetime(train_df[release_date_col], errors="coerce")
+        test_release_dates = pd.to_datetime(test_df[release_date_col], errors="coerce")
+        if train_release_dates.isna().any() or test_release_dates.isna().any():
+            raise ValueError(f"`{release_date_col}` 存在无法解析的日期。")
+        min_history = pd.to_timedelta(int(min_ref_history_weeks), unit="W")
 
     results = []
     for i in range(len(test_df)):
-        ref_idx = top_indices[i]
+        if use_temporal_cutoff:
+            cutoff = test_release_dates.iloc[i] - min_history
+            valid_mask = train_release_dates <= cutoff
+            ref_idx = sorted_indices[i][valid_mask.to_numpy()[sorted_indices[i]]][:k]
+        else:
+            ref_idx = sorted_indices[i][:k]
+        if len(ref_idx) == 0:
+            t_row = test_df.iloc[i]
+            raise ValueError(
+                "时间约束后没有可用 train 邻居: "
+                f"test_code={t_row['external_code']}, test_retail={t_row['retail']}, "
+                f"test_release_date={t_row.get(release_date_col, None)}, "
+                f"min_ref_history_weeks={min_ref_history_weeks}"
+            )
         refs = train_df.iloc[ref_idx][["external_code", "retail", curve_col]].copy()
 
         t_row = test_df.iloc[i]
@@ -80,6 +120,10 @@ def build_similarity_refs(
         refs["test_code"] = t_row["external_code"]
         refs["test_retail"] = t_row["retail"]
         refs["test_curve"] = [t_row[curve_col]] * len(refs)
+        if use_temporal_cutoff:
+            refs["ref_release_date"] = train_release_dates.iloc[ref_idx].values
+            refs["ref_available_date"] = (train_release_dates.iloc[ref_idx] + min_history).values
+            refs["test_release_date"] = test_release_dates.iloc[i]
         refs.rename(columns={curve_col: "curve"}, inplace=True)
         results.append(refs)
 
@@ -342,6 +386,8 @@ def run_similarity_wape(
     start_week: int = 2,
     embedding_col: str = "embedding",
     curve_col: str = "curve",
+    release_date_col: str = "release_date",
+    min_ref_history_weeks: int = 12,
     forecast_mode: Literal["static", "rolling_2w1w"] = "static",
     rolling_teacher_forcing: bool = False,
     rolling_dyn_temp: float = 1.0,
@@ -370,6 +416,8 @@ def run_similarity_wape(
         top_k=top_k,
         embedding_col=embedding_col,
         curve_col=curve_col,
+        release_date_col=release_date_col,
+        min_ref_history_weeks=min_ref_history_weeks,
     )
     if forecast_mode == "static":
         forecast_df = weighted_forecast(final_ref_df)
@@ -499,7 +547,7 @@ def prepare_input_from_file(
 ) -> pd.DataFrame:
     """
     读取 embedding CSV，并生成标准输入列:
-    [external_code, retail, embedding, curve]
+    [external_code, retail, embedding, curve]，若源表含 release_date 则保留。
     nrows: 若给定，在抽样之后（若有）再只保留前 n 行（便于快速测试）。
     sample_frac: 若 <1，先全表读入再按 frac 抽样（需与 export_item_embeddings 的 train_frac/seed 一致）；
                  已导出的对齐表请保持 None 或 1.0。
@@ -543,7 +591,10 @@ def prepare_input_from_file(
 
         out["embedding"] = out[emb_col].apply(_parse_embedding_cell)
         out["curve"] = out[curve_col].apply(_parse_curve_cell)
-        out = out[[code_col, retail_col, "embedding", "curve"]].copy()
+        keep_cols = [code_col, retail_col, "embedding", "curve"]
+        if "release_date" in out.columns:
+            keep_cols.append("release_date")
+        out = out[keep_cols].copy()
         out.rename(columns={code_col: "external_code", retail_col: "retail"}, inplace=True)
         return out
 
@@ -551,10 +602,17 @@ def prepare_input_from_file(
     picked = _pick_prefixed_cols(out)
     if picked is not None:
         code_col, retail_col, curve_col, emb_col = picked
+        prefix = code_col[: -len("_code")]
+        date_col = f"{prefix}_release_date"
         out["embedding"] = out[emb_col].apply(_parse_embedding_cell)
         out["curve"] = out[curve_col].apply(_parse_curve_cell)
-        out = out[[code_col, retail_col, "embedding", "curve"]].copy()
+        keep_cols = [code_col, retail_col, "embedding", "curve"]
+        if date_col in out.columns:
+            keep_cols.append(date_col)
+        out = out[keep_cols].copy()
         out.rename(columns={code_col: "external_code", retail_col: "retail"}, inplace=True)
+        if date_col in out.columns:
+            out.rename(columns={date_col: "release_date"}, inplace=True)
         return out
 
     raise ValueError(
@@ -668,10 +726,21 @@ if __name__ == "__main__":
         default=21,
         help="与 export_item_embeddings --seed 一致（train_frac<1 时）",
     )
+    parser.add_argument(
+        "--min_ref_history_weeks",
+        type=int,
+        default=12,
+        help=(
+            "相似邻居时间约束: 仅允许 train_release_date + N周 <= test_release_date 的 train 样本；"
+            "默认 12，设为 0 可关闭。"
+        ),
+    )
     args = parser.parse_args()
 
     if not (0.0 < args.train_frac <= 1.0):
         raise ValueError(f"--train_frac must be in (0, 1], got {args.train_frac}")
+    if args.min_ref_history_weeks < 0:
+        raise ValueError(f"--min_ref_history_weeks must be >= 0, got {args.min_ref_history_weeks}")
 
     train_df = prepare_input_from_file(
         args.train_csv,
@@ -704,6 +773,7 @@ if __name__ == "__main__":
         train_df=train_df,
         top_k=args.top_k,
         start_week=args.start_week,
+        min_ref_history_weeks=args.min_ref_history_weeks,
         forecast_mode=args.forecast_mode,
         rolling_teacher_forcing=args.rolling_teacher_forcing,
         rolling_dyn_temp=args.rolling_dyn_temp,
@@ -724,6 +794,7 @@ if __name__ == "__main__":
             train_df=train_df,
             top_k=args.top_k,
             start_week=args.start_week,
+            min_ref_history_weeks=args.min_ref_history_weeks,
             forecast_mode=args.forecast_mode,
             rolling_teacher_forcing=args.rolling_teacher_forcing,
             rolling_dyn_temp=args.rolling_dyn_temp,
@@ -738,6 +809,13 @@ if __name__ == "__main__":
     print("=== Similarity Forecast Metrics ===")
     print(f"Samples: {len(forecast_df)}")
     print(f"Top-K: {args.top_k}")
+    if args.min_ref_history_weeks > 0:
+        print(
+            "Temporal ref constraint: "
+            f"train_release_date + {args.min_ref_history_weeks}w <= test_release_date"
+        )
+    else:
+        print("Temporal ref constraint: disabled")
     print(f"Forecast mode: {args.forecast_mode}")
     if args.forecast_mode == "rolling_2w1w":
         print(
@@ -768,6 +846,7 @@ if __name__ == "__main__":
                 train_df=train_df,
                 top_k=k,
                 start_week=args.start_week,
+                min_ref_history_weeks=args.min_ref_history_weeks,
                 forecast_mode=args.forecast_mode,
                 rolling_teacher_forcing=args.rolling_teacher_forcing,
                 rolling_dyn_temp=args.rolling_dyn_temp,
@@ -780,6 +859,7 @@ if __name__ == "__main__":
                     train_df=train_df,
                     top_k=k,
                     start_week=args.start_week,
+                    min_ref_history_weeks=args.min_ref_history_weeks,
                     forecast_mode=args.forecast_mode,
                     rolling_teacher_forcing=args.rolling_teacher_forcing,
                     rolling_dyn_temp=args.rolling_dyn_temp,

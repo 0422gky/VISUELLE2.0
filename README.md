@@ -91,7 +91,23 @@ python similarity_wape_pipeline.py \
 ## Export Item Embedddings
 export：test
 ```bash
-python export_item_embeddings.py --checkpoint "path/to/your.ckpt" --data_folder "dataset/" --split test --output_dir "outputs/"
+python export_item_embeddings.py \
+  --model_type GTM \
+  --checkpoint log/GTM/GTM_Run1---epoch=104---02-04-2026-21-00-31.ckpt \
+  --data_folder visuelle2/ \
+  --split all \
+  --output_dir outputs/GTM_embeddings \
+  --output_dim 10
+```
+
+```bash
+python train_curve_projector.py  --train_embeddings_npy outputs/GTM_embeddings/train_item_embeddings.npy  --train_curves_csv outputs/GTM_embeddings/train_item_embeddings.parquet  --output_dir results/GTM_PCA  --pca_components 32  --epochs 50 --topk_loss_coef 1000 --lambda_metric 0.5
+
+
+python apply_curve_projector.py  --projector_dir results/GTM_PCA  --train_embeddings_npy outputs/GTM_embeddings/train_item_embeddings.npy  --test_embeddings_npy outputs/GTM_embeddings/test_item_embeddings.npy  --output_dir results/GTM_PCA/projected  --device cuda
+
+# 对比学习+PCA
+python similarity_wape_pipeline.py --train_csv outputs/GTM_embeddings/train_item_embeddings.parquet --test_csv outputs/GTM_embeddings/test_item_embeddings.parquet   --train_emb_npy results/GTM_PCA/projected/train_item_embeddings_projected.npy   --test_emb_npy results/GTM_PCA/projected/test_item_embeddings_projected.npy --save_prefix results/GTM_PCA/WAPE_results
 ```
 
 export: train
@@ -551,8 +567,8 @@ python similarity_wape_pipeline.py \
 python train_curve_projector.py  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy  --train_curves_csv outputs/simple_embeddings/train_item_embeddings.parquet  --output_dir results/Simple_PCA  --pca_components 32  --epochs 50 --topk_loss_coef 1000 --lambda_metric 0.5
 
 
-python apply_curve_projector.py  --projector_dir results/curve_projector_pca  --train_embeddings_npy outputs/train_item_embeddings.npy  --test_embeddings_npy outputs/test_item_embeddings.npy  --output_dir results/curve_projector_pca/projected  --device cuda
+python apply_curve_projector.py  --projector_dir results/Simple_PCA  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy  --test_embeddings_npy outputs/simple_embeddings/test_item_embeddings.npy  --output_dir results/Simple_PCA/projected  --device cuda
 
 # 对比学习+PCA
-python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.parquet --test_csv outputs/test_item_embeddings.parquet   --train_emb_npy results/curve_projector_pca/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector_pca/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector_pca/WAPE_results
+python similarity_wape_pipeline.py --train_csv outputs/simple_embeddings/train_item_embeddings.parquet --test_csv outputs/simple_embeddings/test_item_embeddings.parquet   --train_emb_npy results/Simple_PCA/projected/train_item_embeddings_projected.npy   --test_emb_npy results/Simple_PCA/projected/test_item_embeddings_projected.npy --save_prefix results/Simple_PCA/WAPE_results
 ```
