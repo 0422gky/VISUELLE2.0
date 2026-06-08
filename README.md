@@ -544,7 +544,7 @@ python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.par
 
 ### Inference without using the Metric Learning method
 ```bash
-python similarity_wape_pipeline.py --train_csv outputs/simple_embeddings/train_item_embeddings.parquet --test_csv outputs/simple_embeddings/test_item_embeddings.parquet   --train_emb_npy outputs/simple_embeddings/train_item_embeddings.npy   --test_emb_npy outputs/simple_embeddings/test_item_embeddings.npy --save_prefix results/Simple/NO_METRIC/WAPE_results
+python similarity_wape_pipeline.py --train_csv outputs/simple_embeddings/train_item_embeddings.parquet --test_csv outputs/simple_embeddings/test_item_embeddings.parquet   --train_emb_npy outputs/simple_embeddings/train_item_embeddings.npy   --test_emb_npy outputs/simple_embeddings/test_item_embeddings.npy --save_prefix results/Simple/NO_METRIC/WAPE_results --start_week 2
 
 # 2w1w
 python similarity_wape_pipeline.py \
@@ -569,6 +569,29 @@ python train_curve_projector.py  --train_embeddings_npy outputs/simple_embedding
 
 python apply_curve_projector.py  --projector_dir results/Simple_PCA  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy  --test_embeddings_npy outputs/simple_embeddings/test_item_embeddings.npy  --output_dir results/Simple_PCA/projected  --device cuda
 
-# 对比学习+PCA
-python similarity_wape_pipeline.py --train_csv outputs/simple_embeddings/train_item_embeddings.parquet --test_csv outputs/simple_embeddings/test_item_embeddings.parquet   --train_emb_npy results/Simple_PCA/projected/train_item_embeddings_projected.npy   --test_emb_npy results/Simple_PCA/projected/test_item_embeddings_projected.npy --save_prefix results/Simple_PCA/WAPE_results
+# 对比学习+PCA 2w1w
+python similarity_wape_pipeline.py --train_csv outputs/simple_embeddings/train_item_embeddings.parquet --test_csv outputs/simple_embeddings/test_item_embeddings.parquet   --train_emb_npy results/Simple_PCA/projected/train_item_embeddings_projected.npy   --test_emb_npy results/Simple_PCA/projected/test_item_embeddings_projected.npy --save_prefix results/Simple_PCA/WAPE_results_2w1w --forecast_mode rolling_2w1w
+```
+
+
+```bash
+python train_curve_projector.py  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy  --train_curves_csv outputs/simple_embeddings/train_item_embeddings.parquet  --output_dir results/Simple_METRIC_ONLY  --pca_components 0  --epochs 50 --topk_loss_coef 1000 --lambda_metric 0.5
+
+python apply_curve_projector.py  --projector_dir results/Simple_METRIC_ONLY  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy  --test_embeddings_npy outputs/simple_embeddings/test_item_embeddings.npy  --output_dir results/Simple_METRIC_ONLY/projected  --device cuda
+
+python similarity_wape_pipeline.py --train_csv outputs/simple_embeddings/train_item_embeddings.parquet --test_csv outputs/simple_embeddings/test_item_embeddings.parquet   --train_emb_npy results/Simple_METRIC_ONLY/projected/train_item_embeddings_projected.npy   --test_emb_npy results/Simple_METRIC_ONLY/projected/test_item_embeddings_projected.npy --save_prefix results/Simple_METRIC_ONLY/WAPE_results
+```
+
+## export embeddings without MSE train
+
+```bash
+python export_item_embeddings.py \
+  --model_type Simple \
+  --random_init 1 \
+  --data_folder visuelle2/ \
+  --output_dir outputs/simple_random_h \
+  --split all \
+  --device cuda
+
+python similarity_wape_pipeline.py --train_csv outputs/simple_random_h/train_item_embeddings.parquet --test_csv outputs/simple_random_h/test_item_embeddings.parquet   --train_emb_npy outputs/simple_random_h/train_item_embeddings.npy   --test_emb_npy outputs/simple_random_h/test_item_embeddings.npy --save_prefix results/Simple_NO_MSES/WAPE_results_2w1w --forecast_mode rolling_2w1w
 ```
