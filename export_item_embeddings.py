@@ -365,7 +365,7 @@ def export_for_split(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True, help="path/to/model.ckpt or .pth")
+    parser.add_argument("--checkpoint", type=str, default=None, help="path/to/model.ckpt or .pth")
     parser.add_argument("--data_folder", type=str, default="dataset/", help="dataset root folder")
     parser.add_argument("--output_dir", type=str, required=True, help="output directory")
     parser.add_argument("--split", type=str, default="all", choices=["train", "test", "all"])
@@ -458,6 +458,13 @@ def main():
         help="1=快速近似消融2：仅保留 category/color/fabric + image 信号；"
         "导出 embedding 时将 gtrends/temporal_features/recent_sales_2w 置零；0=关闭",
     )
+    parser.add_argument(
+        "--random_init",
+        type=int,
+        default=0,
+        help="1=不加载 checkpoint，直接用随机初始化模型导出 embedding；"
+        "适合导出未经过 MSE 训练的 Simple h=fusion_layer(x_concat)。",
+    )
 
     args = parser.parse_args()
     if not (0.0 < args.train_frac <= 1.0):
@@ -480,8 +487,27 @@ def main():
     args.gtrends = read_gtrends(args.data_folder)
 
     # Load checkpoint + hyper parameters (if available)
-    ckpt = trusted_torch_load(args.checkpoint)
-    hparams = _extract_hparams(ckpt)
+    if args.random_init:
+        if args.model_type != "Simple":
+            print(
+                f"Warning: --random_init=1 with model_type={args.model_type}; "
+                "exporting embeddings from a randomly initialized model."
+            )
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        np.random.seed(args.seed)
+        ckpt = {}
+        hparams = {}
+        print(
+            "random_init=1: skip checkpoint loading; exporting embeddings from "
+            "a randomly initialized model."
+        )
+    else:
+        if args.checkpoint is None:
+            raise ValueError("--checkpoint is required unless --random_init=1")
+        ckpt = trusted_torch_load(args.checkpoint)
+        hparams = _extract_hparams(ckpt)
 
     def get_h(k, default):
         return hparams.get(k, default)
@@ -588,7 +614,8 @@ def main():
             use_hist_sales=get_h("use_hist_sales", args.use_hist_sales),
         )
     model.to(args.device)
-    _load_checkpoint(model, args.checkpoint)
+    if not args.random_init:
+        _load_checkpoint(model, args.checkpoint)
 
     # Ensure trend_len is available for dataset
     args.trend_len = get_h("trend_len", args.trend_len)
