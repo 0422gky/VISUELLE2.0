@@ -1,3 +1,11 @@
+# 人工特征融合
+## 类函数
+- Product Similarity
+- Group Similarity
+## 检验函数
+- test_curves_df
+- test_codes_df
+
 # GTM-Transformer
 Official Pytorch Implementation of [**Well Googled is Half Done: Multimodal Forecasting of New Fashion Product Sales with Image-based Google Trends**](https://arxiv.org/abs/2109.09824) paper
 
