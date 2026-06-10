@@ -512,11 +512,70 @@ python export_item_embeddings.py \
 ```
 
 ## Simple Network
-```bash
-python train.py --model_type Simple --embedding_dim 32 --hidden_dim 64 --output_dim 12
+
+Simple 模型是一个轻量多模态 MLP 表征模型。它读取 category / color / fabric 文本属性、image、temporal features、recent_sales_2w，并经过各模态 projection 后拼接：
+
+```text
+image/text/temporal/recent_sales_2w -> projection -> concat -> fusion_layer -> h -> forecast_head
 ```
 
-### export Simple Network embedding
+后续相似品检索使用的是 `return_embedding=True` 导出的隐藏层表示 `h`，不是 `forecast_head` 的直接预测值。
+
+### Simple 全流程图
+
+```mermaid
+flowchart TD
+    A[visuelle2 train/test data] --> B[train.py --model_type Simple]
+    B --> C[Simple checkpoint<br/>log/Simple/*.ckpt]
+    C --> D[export_item_embeddings.py]
+    D --> E[outputs/simple_embeddings<br/>train/test .npy + .parquet]
+
+    E --> F1[No metric learning]
+    F1 --> G1[similarity_wape_pipeline.py<br/>use raw simple .npy]
+    G1 --> H1[Top-K similar items]
+    H1 --> I1[weighted / rolling forecast]
+    I1 --> J1[MAE / WAPE / Avg_Pearson / Avg_DTW]
+
+    E --> F2[train_curve_projector.py]
+    F2 --> G2[projector.pt + optional PCA]
+    G2 --> H2[apply_curve_projector.py]
+    H2 --> I2[projected train/test .npy]
+    I2 --> J2[similarity_wape_pipeline.py<br/>use projected .npy]
+    J2 --> K2[Top-K similar items]
+    K2 --> L2[weighted / rolling forecast]
+    L2 --> M2[MAE / WAPE / Avg_Pearson / Avg_DTW]
+```
+
+### 1. 训练 Simple 模型
+
+完整训练使用 `train_frac 1`。小样本调试时可以把 `--train_frac` 改成 `0.01`。
+
+```bash
+python train.py \
+  --data_folder visuelle2/ \
+  --model_type Simple \
+  --embedding_dim 32 \
+  --hidden_dim 64 \
+  --output_dim 12 \
+  --batch_size 128 \
+  --epochs 200 \
+  --gpu_num 0 \
+  --train_frac 1 \
+  --log_dir log
+```
+
+训练结束后会在终端打印 best checkpoint 路径，通常类似：
+
+```text
+log/Simple/Simple_Run1---epoch=24---01-06-2026-23-27-54.ckpt
+```
+
+后续导出 embedding 时要使用这个 checkpoint。
+
+### 2. 导出 Simple embedding
+
+用训练好的 Simple checkpoint 导出 train/test/all 的 embedding。推荐 `--split all`，脚本会按 train 在前、test 在后的顺序导出，同时生成拆分后的 `train_item_embeddings.*` 和 `test_item_embeddings.*`。
+
 ```bash
 python export_item_embeddings.py \
   --model_type Simple \
@@ -524,29 +583,43 @@ python export_item_embeddings.py \
   --data_folder visuelle2/ \
   --split all \
   --output_dir outputs/simple_embeddings \
-  --output_dim 10
+  --output_dim 12 \
+  --device cuda
 ```
 
-### Inference using Simple Network
+关键输出：
+
 ```text
-train -> apply (projector) -> similarity wape pipeline
+outputs/simple_embeddings/train_item_embeddings.npy
+outputs/simple_embeddings/test_item_embeddings.npy
+outputs/simple_embeddings/train_item_embeddings.parquet
+outputs/simple_embeddings/test_item_embeddings.parquet
 ```
 
+其中：
+
+- `.npy`：真正用于相似度检索的 embedding 矩阵，行序必须和对应 parquet 一致。
+- `.parquet`：metadata、curve、release_date 等信息，用于 WAPE 和时间约束。
+
+### 3. 不使用 Metric Learning 的预测
+
+这是最直接的 Simple embedding 相似品预测流程：用原始 Simple hidden embedding 做 Top-K 检索。
+
 ```bash
-python train_curve_projector.py  --train_embeddings_npy outputs/train_item_embeddings.npy  --train_curves_csv outputs/train_item_embeddings.parquet  --output_dir results/curve_projector_pca  --pca_components 32  --epochs 50 --topk_loss_coef 1000 --lambda_metric 0.5
-
-
-python apply_curve_projector.py  --projector_dir results/curve_projector_pca  --train_embeddings_npy outputs/train_item_embeddings.npy  --test_embeddings_npy outputs/test_item_embeddings.npy  --output_dir results/curve_projector_pca/projected  --device cuda
-
-# 对比学习+PCA
-python similarity_wape_pipeline.py --train_csv outputs/train_item_embeddings.parquet --test_csv outputs/test_item_embeddings.parquet   --train_emb_npy results/curve_projector_pca/projected/train_item_embeddings_projected.npy   --test_emb_npy results/curve_projector_pca/projected/test_item_embeddings_projected.npy --save_prefix results/curve_projector_pca/WAPE_results
+python similarity_wape_pipeline.py \
+  --train_csv outputs/simple_embeddings/train_item_embeddings.parquet \
+  --test_csv outputs/simple_embeddings/test_item_embeddings.parquet \
+  --train_emb_npy outputs/simple_embeddings/train_item_embeddings.npy \
+  --test_emb_npy outputs/simple_embeddings/test_item_embeddings.npy \
+  --top_k 20 \
+  --start_week 2 \
+  --min_ref_history_weeks 12 \
+  --save_prefix results/Simple/NO_METRIC/WAPE_results
 ```
 
-### Inference without using the Metric Learning method
-```bash
-python similarity_wape_pipeline.py --train_csv outputs/simple_embeddings/train_item_embeddings.parquet --test_csv outputs/simple_embeddings/test_item_embeddings.parquet   --train_emb_npy outputs/simple_embeddings/train_item_embeddings.npy   --test_emb_npy outputs/simple_embeddings/test_item_embeddings.npy --save_prefix results/Simple/NO_METRIC/WAPE_results --start_week 2
+如果要使用 2 周到 1 周滚动预测：
 
-# 2w1w
+```bash
 python similarity_wape_pipeline.py \
   --train_csv outputs/simple_embeddings/train_item_embeddings.parquet \
   --test_csv outputs/simple_embeddings/test_item_embeddings.parquet \
@@ -555,34 +628,110 @@ python similarity_wape_pipeline.py \
   --forecast_mode rolling_2w1w \
   --top_k 20 \
   --start_week 2 \
+  --min_ref_history_weeks 12 \
   --hit_ratio 0.1 \
   --save_prefix results/Simple/NO_METRIC/WAPE_results_2w1w
 ```
 
+### 4. 使用 Metric Learning / PCA 的预测
 
-### Inference with the Metric Learning method(with PCA)
-```bash
-# 关闭PCA只要关闭 pca_components 即可
-
-python train_curve_projector.py  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy  --train_curves_csv outputs/simple_embeddings/train_item_embeddings.parquet  --output_dir results/Simple_PCA  --pca_components 32  --epochs 50 --topk_loss_coef 1000 --lambda_metric 0.5
-
-
-python apply_curve_projector.py  --projector_dir results/Simple_PCA  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy  --test_embeddings_npy outputs/simple_embeddings/test_item_embeddings.npy  --output_dir results/Simple_PCA/projected  --device cuda
-
-# 对比学习+PCA 2w1w
-python similarity_wape_pipeline.py --train_csv outputs/simple_embeddings/train_item_embeddings.parquet --test_csv outputs/simple_embeddings/test_item_embeddings.parquet   --train_emb_npy results/Simple_PCA/projected/train_item_embeddings_projected.npy   --test_emb_npy results/Simple_PCA/projected/test_item_embeddings_projected.npy --save_prefix results/Simple_PCA/WAPE_results_2w1w --forecast_mode rolling_2w1w
-```
-
+这一步先用 train embedding 和 train curve 学一个 projector，让 embedding cosine similarity 更贴近曲线相似度。`--pca_components 32` 表示先 PCA 到 32 维再训练 projector；如果要关闭 PCA，设为 `0`。
 
 ```bash
-python train_curve_projector.py  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy  --train_curves_csv outputs/simple_embeddings/train_item_embeddings.parquet  --output_dir results/Simple_METRIC_ONLY  --pca_components 0  --epochs 50 --topk_loss_coef 1000 --lambda_metric 0.5
-
-python apply_curve_projector.py  --projector_dir results/Simple_METRIC_ONLY  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy  --test_embeddings_npy outputs/simple_embeddings/test_item_embeddings.npy  --output_dir results/Simple_METRIC_ONLY/projected  --device cuda
-
-python similarity_wape_pipeline.py --train_csv outputs/simple_embeddings/train_item_embeddings.parquet --test_csv outputs/simple_embeddings/test_item_embeddings.parquet   --train_emb_npy results/Simple_METRIC_ONLY/projected/train_item_embeddings_projected.npy   --test_emb_npy results/Simple_METRIC_ONLY/projected/test_item_embeddings_projected.npy --save_prefix results/Simple_METRIC_ONLY/WAPE_results
+python train_curve_projector.py \
+  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy \
+  --train_curves_csv outputs/simple_embeddings/train_item_embeddings.parquet \
+  --output_dir results/Simple_PCA \
+  --pca_components 32 \
+  --epochs 50 \
+  --topk_loss_coef 1000 \
+  --lambda_metric 0.5
 ```
 
-## export embeddings without MSE train
+把训练好的 projector 应用到 train/test embedding：
+
+```bash
+python apply_curve_projector.py \
+  --projector_dir results/Simple_PCA \
+  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy \
+  --test_embeddings_npy outputs/simple_embeddings/test_item_embeddings.npy \
+  --output_dir results/Simple_PCA/projected \
+  --device cuda
+```
+
+关键输出：
+
+```text
+results/Simple_PCA/projected/train_item_embeddings_projected.npy
+results/Simple_PCA/projected/test_item_embeddings_projected.npy
+```
+
+然后用 projected embedding 做相似品预测：
+
+```bash
+python similarity_wape_pipeline.py \
+  --train_csv outputs/simple_embeddings/train_item_embeddings.parquet \
+  --test_csv outputs/simple_embeddings/test_item_embeddings.parquet \
+  --train_emb_npy results/Simple_PCA/projected/train_item_embeddings_projected.npy \
+  --test_emb_npy results/Simple_PCA/projected/test_item_embeddings_projected.npy \
+  --top_k 20 \
+  --start_week 2 \
+  --min_ref_history_weeks 12 \
+  --hit_ratio 0.1 \
+  --save_prefix results/Simple_PCA/WAPE_results
+```
+
+滚动预测版本：
+
+```bash
+python similarity_wape_pipeline.py \
+  --train_csv outputs/simple_embeddings/train_item_embeddings.parquet \
+  --test_csv outputs/simple_embeddings/test_item_embeddings.parquet \
+  --train_emb_npy results/Simple_PCA/projected/train_item_embeddings_projected.npy \
+  --test_emb_npy results/Simple_PCA/projected/test_item_embeddings_projected.npy \
+  --forecast_mode rolling_2w1w \
+  --top_k 20 \
+  --start_week 2 \
+  --min_ref_history_weeks 12 \
+  --hit_ratio 0.1 \
+  --save_prefix results/Simple_PCA/WAPE_results_2w1w
+```
+
+### 5. Metric Learning without PCA
+
+只关闭 PCA，其余流程相同：
+
+```bash
+python train_curve_projector.py \
+  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy \
+  --train_curves_csv outputs/simple_embeddings/train_item_embeddings.parquet \
+  --output_dir results/Simple_METRIC_ONLY \
+  --pca_components 0 \
+  --epochs 50 \
+  --topk_loss_coef 1000 \
+  --lambda_metric 0.5
+
+python apply_curve_projector.py \
+  --projector_dir results/Simple_METRIC_ONLY \
+  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy \
+  --test_embeddings_npy outputs/simple_embeddings/test_item_embeddings.npy \
+  --output_dir results/Simple_METRIC_ONLY/projected \
+  --device cuda
+
+python similarity_wape_pipeline.py \
+  --train_csv outputs/simple_embeddings/train_item_embeddings.parquet \
+  --test_csv outputs/simple_embeddings/test_item_embeddings.parquet \
+  --train_emb_npy results/Simple_METRIC_ONLY/projected/train_item_embeddings_projected.npy \
+  --test_emb_npy results/Simple_METRIC_ONLY/projected/test_item_embeddings_projected.npy \
+  --top_k 20 \
+  --start_week 2 \
+  --min_ref_history_weeks 12 \
+  --save_prefix results/Simple_METRIC_ONLY/WAPE_results
+```
+
+### 6. 未经过 MSE 训练的 Simple embedding
+
+如果只想导出随机初始化的 Simple hidden representation，用 `--random_init 1`。这不会加载 checkpoint，适合做未训练 MLP 表征的 baseline。
 
 ```bash
 python export_item_embeddings.py \
@@ -593,5 +742,16 @@ python export_item_embeddings.py \
   --split all \
   --device cuda
 
-python similarity_wape_pipeline.py --train_csv outputs/simple_random_h/train_item_embeddings.parquet --test_csv outputs/simple_random_h/test_item_embeddings.parquet   --train_emb_npy outputs/simple_random_h/train_item_embeddings.npy   --test_emb_npy outputs/simple_random_h/test_item_embeddings.npy --save_prefix results/Simple_NO_MSES/WAPE_results_2w1w --forecast_mode rolling_2w1w
+python similarity_wape_pipeline.py \
+  --train_csv outputs/simple_random_h/train_item_embeddings.parquet \
+  --test_csv outputs/simple_random_h/test_item_embeddings.parquet \
+  --train_emb_npy outputs/simple_random_h/train_item_embeddings.npy \
+  --test_emb_npy outputs/simple_random_h/test_item_embeddings.npy \
+  --forecast_mode rolling_2w1w \
+  --top_k 20 \
+  --start_week 2 \
+  --min_ref_history_weeks 12 \
+  --save_prefix results/Simple_NO_MSE/WAPE_results_2w1w
 ```
+
+注意：projected embedding 推荐直接通过 `--train_emb_npy` / `--test_emb_npy` 传给 `similarity_wape_pipeline.py`，不要只把 projected npy 转成 parquet 后直接替换输入，除非确认 parquet 中实际被读取的 `train_emb` / `test_emb` 列已经被覆盖。
