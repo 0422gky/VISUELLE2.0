@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 from typing import Iterable, Literal, Tuple
 
 import numpy as np
@@ -328,6 +329,69 @@ def curve_shape_metrics_from_forecast_df(
     return avg_pearson_avg_dtw(gt, pred, wsl=start_idx, tw=None)
 
 
+def calc_forecast_component_metrics(
+    forecast_df: pd.DataFrame,
+    pred_col: str,
+    start_week: int = 2,
+) -> tuple[float, float, float, float]:
+    """对 forecast_df 中指定预测列计算 MAE/WAPE/Avg_Pearson/Avg_DTW。"""
+    if pred_col not in forecast_df.columns:
+        raise ValueError(f"forecast_df 缺少预测列: {pred_col}")
+    mae, wape = calc_mae_wape(
+        gt_list=forecast_df["true_curve"],
+        pred_list=forecast_df[pred_col],
+        start_week=start_week,
+    )
+    tmp = forecast_df[["true_curve", pred_col]].rename(columns={pred_col: "pred_curve"})
+    avg_pearson, avg_dtw = curve_shape_metrics_from_forecast_df(tmp, start_week=start_week)
+    return mae, wape, avg_pearson, avg_dtw
+
+
+def blend_forecast_df(
+    forecast_df: pd.DataFrame,
+    e2e_pred_matrix: np.ndarray,
+    blend_lambda: float,
+) -> pd.DataFrame:
+    """
+    将相似品预测与端到端预测头输出融合。
+
+    pred_curve 在输出中表示最终混合预测；原相似品预测保存在 similarity_pred_curve。
+    """
+    if not (0.0 <= float(blend_lambda) <= 1.0):
+        raise ValueError(f"blend_lambda 必须在 [0, 1]，当前 {blend_lambda}")
+    if forecast_df.empty:
+        return forecast_df.copy()
+
+    sim_pred = np.stack([np.asarray(x, dtype=np.float64) for x in forecast_df["pred_curve"]])
+    true_curve = np.stack([np.asarray(x, dtype=np.float64) for x in forecast_df["true_curve"]])
+    e2e_pred = np.asarray(e2e_pred_matrix, dtype=np.float64)
+
+    if e2e_pred.ndim != 2:
+        raise ValueError(f"e2e_pred_matrix 应为二维数组 (N, L)，当前 shape={e2e_pred.shape}")
+    if e2e_pred.shape != sim_pred.shape:
+        raise ValueError(
+            "端到端预测与相似品预测 shape 不一致: "
+            f"e2e={e2e_pred.shape}, similarity={sim_pred.shape}"
+        )
+    if e2e_pred.shape != true_curve.shape:
+        raise ValueError(
+            "端到端预测与真实曲线 shape 不一致: "
+            f"e2e={e2e_pred.shape}, true={true_curve.shape}"
+        )
+    if not np.isfinite(e2e_pred).all():
+        raise ValueError("端到端预测中存在 NaN/Inf；请提供完整预测曲线后再混合。")
+
+    lam = float(blend_lambda)
+    blended = lam * sim_pred + (1.0 - lam) * e2e_pred
+
+    out = forecast_df.copy()
+    out["similarity_pred_curve"] = [row.tolist() for row in sim_pred]
+    out["e2e_pred_curve"] = [row.tolist() for row in e2e_pred]
+    out["blend_lambda"] = lam
+    out["pred_curve"] = [row.tolist() for row in blended]
+    return out
+
+
 def add_sum_columns_to_forecast(forecast_df: pd.DataFrame, start_week: int) -> pd.DataFrame:
     """
     为爆款捕捉率计算增加评估窗口内的真实/预测总销量列。
@@ -391,6 +455,8 @@ def run_similarity_wape(
     forecast_mode: Literal["static", "rolling_2w1w"] = "static",
     rolling_teacher_forcing: bool = False,
     rolling_dyn_temp: float = 1.0,
+    e2e_pred_matrix: np.ndarray | None = None,
+    blend_lambda: float | None = None,
 ) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
@@ -430,6 +496,9 @@ def run_similarity_wape(
         )
     else:
         raise ValueError(f"未知 forecast_mode: {forecast_mode}")
+    if e2e_pred_matrix is not None:
+        lam = 0.5 if blend_lambda is None else float(blend_lambda)
+        forecast_df = blend_forecast_df(forecast_df, e2e_pred_matrix=e2e_pred_matrix, blend_lambda=lam)
     mae, wape = calc_mae_wape(
         gt_list=forecast_df["true_curve"],
         pred_list=forecast_df["pred_curve"],
@@ -493,7 +562,11 @@ def _parse_curve_cell(value) -> np.ndarray:
     if isinstance(value, list):
         return np.asarray(value, dtype=float)
     if isinstance(value, str):
-        return np.asarray(ast.literal_eval(value), dtype=float)
+        text = value.strip()
+        try:
+            return np.asarray(json.loads(text), dtype=float)
+        except json.JSONDecodeError:
+            return np.asarray(ast.literal_eval(text), dtype=float)
     raise ValueError(f"无法解析 curve 值类型: {type(value)}")
 
 
@@ -516,6 +589,92 @@ def _read_table(path: str, nrows: int | None = None) -> pd.DataFrame:
             return pd.read_parquet(path).head(int(nrows))
         return pd.read_parquet(path)
     return pd.read_csv(path, **read_kw)
+
+
+def _pick_week_cols(df: pd.DataFrame, prefix: str) -> list[str]:
+    cols = []
+    for col in df.columns:
+        if not col.startswith(prefix):
+            continue
+        suffix = col[len(prefix) :]
+        if suffix.isdigit():
+            cols.append(col)
+    return sorted(cols, key=lambda x: int(x[len(prefix) :]))
+
+
+def _ensure_prediction_matrix(
+    matrix: np.ndarray,
+    *,
+    n_expected: int,
+    curve_len: int,
+    source: str,
+) -> np.ndarray:
+    pred = np.asarray(matrix, dtype=np.float64)
+    if pred.ndim != 2:
+        raise ValueError(f"{source} 应为二维预测矩阵 (N, L)，当前 shape={pred.shape}")
+    if pred.shape[0] < n_expected:
+        raise ValueError(
+            f"{source} 行数不足: 需要至少 {n_expected} 行，当前 {pred.shape[0]} 行。"
+        )
+    if pred.shape[0] > n_expected:
+        pred = pred[:n_expected]
+    if pred.shape[1] != curve_len:
+        raise ValueError(
+            f"{source} 预测长度必须等于 curve 长度 {curve_len}，当前 {pred.shape[1]}。"
+        )
+    if not np.isfinite(pred).all():
+        raise ValueError(f"{source} 存在 NaN/Inf；请提供完整 {curve_len} 周预测。")
+    return pred
+
+
+def load_e2e_predictions(
+    path: str,
+    *,
+    n_expected: int,
+    curve_len: int,
+    pred_col: str = "e2e_pred_curve",
+) -> np.ndarray:
+    """
+    读取端到端预测头输出，行序必须与 test_df 一致。
+
+    支持:
+    - .npy: (N, L)
+    - .csv/.parquet: pred_col / sales_predicted_12w_restored / pred_sales_wk_*
+    """
+    lower = path.lower()
+    if lower.endswith(".npy"):
+        return _ensure_prediction_matrix(
+            np.load(path),
+            n_expected=n_expected,
+            curve_len=curve_len,
+            source=path,
+        )
+    if not (lower.endswith(".csv") or lower.endswith(".parquet")):
+        raise ValueError(f"端到端预测文件格式不支持: {path}，仅支持 .npy/.csv/.parquet")
+
+    df = _read_table(path, nrows=None)
+    if pred_col in df.columns:
+        matrix = np.stack(df[pred_col].apply(_parse_curve_cell).values)
+        source = f"{path}:{pred_col}"
+    elif "sales_predicted_12w_restored" in df.columns:
+        matrix = np.stack(df["sales_predicted_12w_restored"].apply(_parse_curve_cell).values)
+        source = f"{path}:sales_predicted_12w_restored"
+    else:
+        week_cols = _pick_week_cols(df, "pred_sales_wk_")
+        if not week_cols:
+            raise ValueError(
+                f"{path} 缺少端到端预测列。请提供 `{pred_col}`、"
+                "`sales_predicted_12w_restored` 或 `pred_sales_wk_*`。"
+            )
+        matrix = df[week_cols].to_numpy(dtype=np.float64)
+        source = f"{path}:pred_sales_wk_*"
+
+    return _ensure_prediction_matrix(
+        matrix,
+        n_expected=n_expected,
+        curve_len=curve_len,
+        source=source,
+    )
 
 
 def _pick_prefixed_cols(df: pd.DataFrame) -> tuple[str, str, str, str] | None:
@@ -703,6 +862,22 @@ if __name__ == "__main__":
         help="可选: (M,D) 投影后的 test embedding，行序须与 test_csv 一致",
     )
     parser.add_argument(
+        "--e2e_pred_path",
+        default="",
+        help="可选: 端到端预测头输出文件（.npy/.csv/.parquet），行序须与 test_csv 一致",
+    )
+    parser.add_argument(
+        "--e2e_pred_col",
+        default="e2e_pred_curve",
+        help="CSV/Parquet 中端到端预测曲线列名；若不存在会尝试 sales_predicted_12w_restored 或 pred_sales_wk_*",
+    )
+    parser.add_argument(
+        "--blend_lambda",
+        type=float,
+        default=0.5,
+        help="启用 --e2e_pred_path 时的固定融合权重: lambda*相似品预测 + (1-lambda)*端到端预测",
+    )
+    parser.add_argument(
         "--train_nrows",
         type=int,
         default=None,
@@ -741,6 +916,8 @@ if __name__ == "__main__":
         raise ValueError(f"--train_frac must be in (0, 1], got {args.train_frac}")
     if args.min_ref_history_weeks < 0:
         raise ValueError(f"--min_ref_history_weeks must be >= 0, got {args.min_ref_history_weeks}")
+    if args.e2e_pred_path and not (0.0 <= args.blend_lambda <= 1.0):
+        raise ValueError(f"--blend_lambda must be in [0, 1], got {args.blend_lambda}")
 
     train_df = prepare_input_from_file(
         args.train_csv,
@@ -758,6 +935,15 @@ if __name__ == "__main__":
         train_df = attach_embeddings_from_npy(train_df, args.train_emb_npy)
     if args.test_emb_npy:
         test_df = attach_embeddings_from_npy(test_df, args.test_emb_npy)
+    e2e_pred_matrix = None
+    if args.e2e_pred_path:
+        curve_len = _to_2d_array(test_df["curve"], "curve").shape[1]
+        e2e_pred_matrix = load_e2e_predictions(
+            args.e2e_pred_path,
+            n_expected=len(test_df),
+            curve_len=curve_len,
+            pred_col=args.e2e_pred_col,
+        )
 
     (
         final_ref_df,
@@ -777,17 +963,43 @@ if __name__ == "__main__":
         forecast_mode=args.forecast_mode,
         rolling_teacher_forcing=args.rolling_teacher_forcing,
         rolling_dyn_temp=args.rolling_dyn_temp,
+        e2e_pred_matrix=e2e_pred_matrix,
+        blend_lambda=args.blend_lambda if e2e_pred_matrix is not None else None,
     )
     forecast_df = add_sum_columns_to_forecast(forecast_df, start_week=args.start_week)
+    component_metrics = None
+    if e2e_pred_matrix is not None:
+        component_metrics = {
+            "similarity": calc_forecast_component_metrics(
+                forecast_df,
+                pred_col="similarity_pred_curve",
+                start_week=args.start_week,
+            ),
+            "e2e": calc_forecast_component_metrics(
+                forecast_df,
+                pred_col="e2e_pred_curve",
+                start_week=args.start_week,
+            ),
+            "blended": (mae, wape, avg_pearson, avg_dtw),
+        }
 
     hit_source_df = forecast_df
     hit_test_df_for_capture = None
+    hit_e2e_pred_matrix = None
     if args.test_nrows is not None:
         hit_test_df_for_capture = prepare_input_from_file(args.test_csv, nrows=None)
         if args.test_emb_npy:
             hit_test_df_for_capture = attach_embeddings_from_npy(
                 hit_test_df_for_capture,
                 args.test_emb_npy,
+            )
+        if args.e2e_pred_path:
+            hit_curve_len = _to_2d_array(hit_test_df_for_capture["curve"], "curve").shape[1]
+            hit_e2e_pred_matrix = load_e2e_predictions(
+                args.e2e_pred_path,
+                n_expected=len(hit_test_df_for_capture),
+                curve_len=hit_curve_len,
+                pred_col=args.e2e_pred_col,
             )
         _, hit_forecast_df, _, _, _, _, _, _ = run_similarity_wape(
             test_df=hit_test_df_for_capture,
@@ -798,6 +1010,8 @@ if __name__ == "__main__":
             forecast_mode=args.forecast_mode,
             rolling_teacher_forcing=args.rolling_teacher_forcing,
             rolling_dyn_temp=args.rolling_dyn_temp,
+            e2e_pred_matrix=hit_e2e_pred_matrix,
+            blend_lambda=args.blend_lambda if hit_e2e_pred_matrix is not None else None,
         )
         hit_source_df = add_sum_columns_to_forecast(hit_forecast_df, start_week=args.start_week)
 
@@ -817,6 +1031,25 @@ if __name__ == "__main__":
     else:
         print("Temporal ref constraint: disabled")
     print(f"Forecast mode: {args.forecast_mode}")
+    if e2e_pred_matrix is not None:
+        print(f"Blend mode: enabled, lambda={args.blend_lambda}")
+        sim_mae, sim_wape, sim_ap, sim_dtw = component_metrics["similarity"]
+        e2e_mae, e2e_wape, e2e_ap, e2e_dtw = component_metrics["e2e"]
+        blend_mae, blend_wape, blend_ap, blend_dtw = component_metrics["blended"]
+        print(
+            f"Similarity-only -> MAE: {sim_mae:.3f}, WAPE: {sim_wape:.3f}%, "
+            f"Avg_P: {sim_ap:.4f}, Avg_DTW: {sim_dtw:.4f}"
+        )
+        print(
+            f"E2E-only        -> MAE: {e2e_mae:.3f}, WAPE: {e2e_wape:.3f}%, "
+            f"Avg_P: {e2e_ap:.4f}, Avg_DTW: {e2e_dtw:.4f}"
+        )
+        print(
+            f"Blended         -> MAE: {blend_mae:.3f}, WAPE: {blend_wape:.3f}%, "
+            f"Avg_P: {blend_ap:.4f}, Avg_DTW: {blend_dtw:.4f}"
+        )
+    else:
+        print("Blend mode: disabled")
     if args.forecast_mode == "rolling_2w1w":
         print(
             f"Rolling cfg: input_weeks=2, teacher_forcing={args.rolling_teacher_forcing}, "
@@ -850,6 +1083,8 @@ if __name__ == "__main__":
                 forecast_mode=args.forecast_mode,
                 rolling_teacher_forcing=args.rolling_teacher_forcing,
                 rolling_dyn_temp=args.rolling_dyn_temp,
+                e2e_pred_matrix=e2e_pred_matrix,
+                blend_lambda=args.blend_lambda if e2e_pred_matrix is not None else None,
             )
             fc_k = add_sum_columns_to_forecast(fc_k, start_week=args.start_week)
             hit_eval_df_k = fc_k
@@ -863,6 +1098,8 @@ if __name__ == "__main__":
                     forecast_mode=args.forecast_mode,
                     rolling_teacher_forcing=args.rolling_teacher_forcing,
                     rolling_dyn_temp=args.rolling_dyn_temp,
+                    e2e_pred_matrix=hit_e2e_pred_matrix,
+                    blend_lambda=args.blend_lambda if hit_e2e_pred_matrix is not None else None,
                 )
                 hit_eval_df_k = add_sum_columns_to_forecast(
                     hit_fc_k,
