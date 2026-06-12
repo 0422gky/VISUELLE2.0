@@ -755,3 +755,204 @@ python similarity_wape_pipeline.py \
 ```
 
 注意：projected embedding 推荐直接通过 `--train_emb_npy` / `--test_emb_npy` 传给 `similarity_wape_pipeline.py`，不要只把 projected npy 转成 parquet 后直接替换输入，除非确认 parquet 中实际被读取的 `train_emb` / `test_emb` 列已经被覆盖。
+
+### 7. 端到端预测 + 相似品检索混合预测
+
+这一流程对应 `TEACHER.md` 中的公式：
+
+```text
+final_pred = lambda * similarity_pred + (1 - lambda) * e2e_pred
+```
+
+其中：
+
+- `similarity_pred`：`similarity_wape_pipeline.py` 原本的相似品 Top-K 加权预测结果。
+- `e2e_pred`：Simple 模型 `forecast_head` 的端到端预测结果。
+- `final_pred`：最终用于 WAPE / Hit Capture Rate 的混合预测。
+- `lambda`：固定融合权重。`lambda` 越大，越依赖相似品路径；越小，越依赖端到端预测头。
+
+#### 7.1 先训练 Simple checkpoint
+
+如果已经有训练好的 Simple checkpoint，可以跳过这一步。
+
+```bash
+python train.py \
+  --data_folder visuelle2/ \
+  --model_type Simple \
+  --embedding_dim 32 \
+  --hidden_dim 64 \
+  --output_dim 12 \
+  --batch_size 128 \
+  --epochs 200 \
+  --gpu_num 0 \
+  --train_frac 1 \
+  --log_dir log
+```
+
+后续命令中的 checkpoint 示例：
+
+```text
+log/Simple/Simple_Run1---epoch=24---01-06-2026-23-27-54.ckpt
+```
+
+#### 7.2 导出端到端预测头输出
+
+用 `forecast_csv.py` 生成 Simple 模型预测头的 12 周预测。这里必须使用 `--output_dim 12`，否则导出的 `sales_predicted_12w_restored` 里会有空值，混合预测会报错。
+
+```bash
+python forecast_csv.py \
+  --model_type Simple \
+  --data_folder visuelle2/ \
+  --ckpt_path log/Simple/Simple_Run1---epoch=24---01-06-2026-23-27-54.ckpt \
+  --output_dim 12 \
+  --gpu_num 0 \
+  --output_csv results/Simple/simple_e2e_forecast.csv \
+  --wide_sales_weeks
+```
+
+这个文件会被 `similarity_wape_pipeline.py` 作为 `--e2e_pred_path` 读取。默认优先读取：
+
+```text
+sales_predicted_12w_restored
+```
+
+如果使用 `--wide_sales_weeks`，也可以兼容读取：
+
+```text
+pred_sales_wk_0 ... pred_sales_wk_11
+```
+
+注意：`forecast_csv.py` 中 `sales_predicted_12w_restored` 的列名虽然带有 `restored`，但当前注释说明它保存的是和 train/test CSV 前 12 周一致的归一化空间曲线，适合与 `similarity_wape_pipeline.py` 的 `curve` 做混合。不要把已经乘过 `normalization_scale` 的真实销量预测和归一化曲线混在一起。
+
+#### 7.3 导出用于相似品检索的 hidden representation h
+
+相似品检索使用的是 `return_embedding=True` 导出的 hidden representation `h`，不是 `forecast_head` 输出。
+
+```bash
+python export_item_embeddings.py \
+  --model_type Simple \
+  --checkpoint log/Simple/Simple_Run1---epoch=24---01-06-2026-23-27-54.ckpt \
+  --data_folder visuelle2/ \
+  --split all \
+  --output_dir outputs/simple_embeddings \
+  --output_dim 12 \
+  --device cuda
+```
+
+关键输出：
+
+```text
+outputs/simple_embeddings/train_item_embeddings.npy
+outputs/simple_embeddings/test_item_embeddings.npy
+outputs/simple_embeddings/train_item_embeddings.parquet
+outputs/simple_embeddings/test_item_embeddings.parquet
+```
+
+#### 7.4 可选：训练并应用 curve projector
+
+如果要使用 metric learning / PCA 后的 embedding，先训练 projector：
+
+```bash
+python train_curve_projector.py \
+  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy \
+  --train_curves_csv outputs/simple_embeddings/train_item_embeddings.parquet \
+  --output_dir results/Simple_PCA \
+  --pca_components 32 \
+  --epochs 50 \
+  --topk_loss_coef 1000 \
+  --lambda_metric 0.5
+```
+
+再应用到 train/test：
+
+```bash
+python apply_curve_projector.py \
+  --projector_dir results/Simple_PCA \
+  --train_embeddings_npy outputs/simple_embeddings/train_item_embeddings.npy \
+  --test_embeddings_npy outputs/simple_embeddings/test_item_embeddings.npy \
+  --output_dir results/Simple_PCA/projected \
+  --device cuda
+```
+
+如果不使用 projector，后续命令中的 `--train_emb_npy` / `--test_emb_npy` 直接换成 `outputs/simple_embeddings/*.npy` 即可。
+
+#### 7.5 运行混合预测 WAPE
+
+使用 projected embedding 的版本：
+
+```bash
+python similarity_wape_pipeline.py \
+  --train_csv outputs/simple_embeddings/train_item_embeddings.parquet \
+  --test_csv outputs/simple_embeddings/test_item_embeddings.parquet \
+  --train_emb_npy results/Simple_PCA/projected/train_item_embeddings_projected.npy \
+  --test_emb_npy results/Simple_PCA/projected/test_item_embeddings_projected.npy \
+  --e2e_pred_path results/Simple/simple_e2e_forecast.csv \
+  --blend_lambda 0.5 \
+  --top_k 20 \
+  --start_week 2 \
+  --min_ref_history_weeks 12 \
+  --hit_ratio 0.1 \
+  --compare_topk 1,5,20 \
+  --save_prefix results/Simple_MIXED/WAPE_results
+```
+
+不使用 projector 的版本：
+
+```bash
+python similarity_wape_pipeline.py \
+  --train_csv outputs/simple_embeddings/train_item_embeddings.parquet \
+  --test_csv outputs/simple_embeddings/test_item_embeddings.parquet \
+  --train_emb_npy outputs/simple_embeddings/train_item_embeddings.npy \
+  --test_emb_npy outputs/simple_embeddings/test_item_embeddings.npy \
+  --e2e_pred_path results/Simple/simple_e2e_forecast.csv \
+  --blend_lambda 0.5 \
+  --top_k 20 \
+  --start_week 2 \
+  --min_ref_history_weeks 12 \
+  --hit_ratio 0.1 \
+  --compare_topk 1,5,20 \
+  --save_prefix results/Simple_MIXED_RAW/WAPE_results
+```
+
+如果要用滚动预测作为相似品路径，再加：
+
+```bash
+--forecast_mode rolling_2w1w --rolling_dyn_temp 1.0
+```
+
+#### 7.6 输出文件和指标含义
+
+启用 `--e2e_pred_path` 后，控制台会打印三组指标：
+
+```text
+Similarity-only -> 原相似品检索预测
+E2E-only        -> Simple forecast_head 端到端预测
+Blended         -> lambda 加权后的最终预测
+```
+
+主指标 `Global MAE`、`Global WAPE`、`Avg_Pearson`、`Avg_DTW` 和 `Hit Capture Rate` 使用的是最终混合后的 `pred_curve`。
+
+保存文件：
+
+```text
+results/Simple_MIXED/WAPE_results_final_ref.csv
+results/Simple_MIXED/WAPE_results_forecast.csv
+```
+
+其中 `*_forecast.csv` 里关键列为：
+
+- `similarity_pred_curve`：相似品 Top-K 加权预测。
+- `e2e_pred_curve`：端到端预测头输出。
+- `pred_curve`：最终混合预测，也是 WAPE 使用的预测。
+- `true_curve`：真实 12 周曲线。
+- `blend_lambda`：本次使用的融合权重。
+- `Actual_sum_i` / `Pred_sum_i`：Hit Capture Rate 使用的评估窗口总销量。
+
+#### 7.7 常见检查项
+
+- `--e2e_pred_path` 的行顺序必须和 `--test_csv` 完全一致。
+- `--output_dim` 建议固定为 `12`，保证端到端预测是完整 12 周。
+- `--blend_lambda 1.0` 等价于只用相似品预测。
+- `--blend_lambda 0.0` 等价于只用端到端预测。
+- 如果看到 NaN/Inf 报错，通常是 `forecast_csv.py --output_dim` 小于 12，或者预测文件里有空值。
+- 如果使用 `--test_nrows` 调试，脚本会对主评估使用前 n 行；Hit Capture Rate 的 full-test 分支会读取完整 test，并要求端到端预测文件也覆盖完整 test。
